@@ -40,6 +40,16 @@ impl ErrorMapper {
                 code: CODE_INTERNAL_ERROR,
                 message: "Execution timeout".to_string(),
             },
+            ApcoreErrorCode::ExecutionCancelled => JsonRpcError {
+                code: CODE_INTERNAL_ERROR,
+                message: "Execution cancelled".to_string(),
+            },
+            ApcoreErrorCode::CircuitBreakerOpen | ApcoreErrorCode::TaskLimitExceeded => {
+                JsonRpcError {
+                    code: CODE_INTERNAL_ERROR,
+                    message: "Service temporarily unavailable".to_string(),
+                }
+            }
             ApcoreErrorCode::CallDepthExceeded
             | ApcoreErrorCode::CircularCall
             | ApcoreErrorCode::CallFrequencyExceeded => JsonRpcError {
@@ -180,6 +190,30 @@ mod tests {
     fn test_sanitize_collapses_whitespace() {
         let msg = sanitize_message("a\n\n   b\t\tc");
         assert_eq!(msg, "a b c");
+    }
+
+    #[test]
+    fn test_execution_cancelled() {
+        let err = make_error(ApcoreErrorCode::ExecutionCancelled, "cancelled");
+        let resp = ErrorMapper::to_jsonrpc_error(&err);
+        assert_eq!(resp.code, CODE_INTERNAL_ERROR);
+        assert_eq!(resp.message, "Execution cancelled");
+    }
+
+    #[test]
+    fn test_circuit_breaker_open() {
+        let err = make_error(ApcoreErrorCode::CircuitBreakerOpen, "open");
+        let resp = ErrorMapper::to_jsonrpc_error(&err);
+        assert_eq!(resp.code, CODE_INTERNAL_ERROR);
+        assert_eq!(resp.message, "Service temporarily unavailable");
+    }
+
+    #[test]
+    fn test_task_limit_exceeded() {
+        let err = make_error(ApcoreErrorCode::TaskLimitExceeded, "too many");
+        let resp = ErrorMapper::to_jsonrpc_error(&err);
+        assert_eq!(resp.code, CODE_INTERNAL_ERROR);
+        assert_eq!(resp.message, "Service temporarily unavailable");
     }
 
     #[test]
