@@ -37,18 +37,29 @@ struct Claims {
 }
 
 pub struct JWTAuthenticator {
-    secret: String,
+    /// Verification key material: HMAC secret for HS*, or a PEM public key for
+    /// RS*/ES*. The interpretation depends on the configured algorithms.
+    key: String,
     claim_mapping: ClaimMapping,
     /// Claims that MUST be present for the token to be accepted (Python/TS parity).
     require_claims: Vec<String>,
+    /// Allowed JWT algorithms (default `["HS256"]`, Python/TS parity).
+    algorithms: Vec<Algorithm>,
+    /// Expected `aud` claim; verified when set (Python/TS parity).
+    audience: Option<String>,
+    /// Expected `iss` claim; verified when set (Python/TS parity).
+    issuer: Option<String>,
 }
 
 impl JWTAuthenticator {
     pub fn new(secret: impl Into<String>) -> Self {
         Self {
-            secret: secret.into(),
+            key: secret.into(),
             claim_mapping: ClaimMapping::default(),
             require_claims: vec![],
+            algorithms: vec![Algorithm::HS256],
+            audience: None,
+            issuer: None,
         }
     }
 
@@ -62,6 +73,47 @@ impl JWTAuthenticator {
         self.require_claims = claims;
         self
     }
+
+    /// Set the allowed JWT algorithms (default `["HS256"]`).
+    ///
+    /// For asymmetric algorithms (RS256/ES256), the authenticator's key must be
+    /// the PEM-encoded public key.
+    pub fn with_algorithms(mut self, algorithms: Vec<Algorithm>) -> Self {
+        if !algorithms.is_empty() {
+            self.algorithms = algorithms;
+        }
+        self
+    }
+
+    /// Verify the `aud` claim against the given audience.
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
+    }
+
+    /// Verify the `iss` claim against the given issuer.
+    pub fn with_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.issuer = Some(issuer.into());
+        self
+    }
+
+    /// Build the appropriate `DecodingKey` for the configured algorithm family.
+    ///
+    /// HS* algorithms treat `key` as a raw HMAC secret; RS* / PS* and ES*
+    /// treat it as a PEM-encoded public key.
+    fn decoding_key(&self) -> Option<DecodingKey> {
+        use Algorithm::*;
+        // Algorithms are validated to be a single family at decode time; pick
+        // the first to decide how to interpret the key material.
+        match self.algorithms.first().copied().unwrap_or(HS256) {
+            HS256 | HS384 | HS512 => Some(DecodingKey::from_secret(self.key.as_bytes())),
+            RS256 | RS384 | RS512 | PS256 | PS384 | PS512 => {
+                DecodingKey::from_rsa_pem(self.key.as_bytes()).ok()
+            }
+            ES256 | ES384 => DecodingKey::from_ec_pem(self.key.as_bytes()).ok(),
+            EdDSA => DecodingKey::from_ed_pem(self.key.as_bytes()).ok(),
+        }
+    }
 }
 
 #[async_trait]
@@ -70,13 +122,23 @@ impl Authenticator for JWTAuthenticator {
         let auth_header = headers.get("authorization")?;
         let token = auth_header.strip_prefix("Bearer ")?;
 
-        let key = DecodingKey::from_secret(self.secret.as_bytes());
-        let mut validation = Validation::new(Algorithm::HS256);
+        let key = self.decoding_key()?;
+        let primary_alg = self.algorithms.first().copied().unwrap_or(Algorithm::HS256);
+        let mut validation = Validation::new(primary_alg);
+        validation.algorithms = self.algorithms.clone();
         // Reject expired tokens (Python/TS parity).
         validation.validate_exp = true;
         // `sub` is not universally present and is mapped explicitly below; do not
         // require it at the jsonwebtoken layer.
         validation.required_spec_claims.clear();
+        // Verify aud/iss only when configured (Python/TS parity).
+        match &self.audience {
+            Some(aud) => validation.set_audience(&[aud]),
+            None => validation.validate_aud = false,
+        }
+        if let Some(iss) = &self.issuer {
+            validation.set_issuer(&[iss]);
+        }
 
         let data = decode::<Claims>(token, &key, &validation).ok()?;
         let claims = data.claims.extra;
@@ -189,6 +251,49 @@ mod tests {
         assert_eq!(identity.identity_type(), "service");
         assert_eq!(identity.get_attr("org"), Some(&json!("acme")));
         assert_eq!(identity.get_attr("tenant"), Some(&json!("t1")));
+    }
+
+    #[tokio::test]
+    async fn correct_audience_and_issuer_accepted() {
+        let auth = JWTAuthenticator::new(SECRET)
+            .with_audience("my-aud")
+            .with_issuer("my-iss");
+        let t = token(&json!({
+            "sub": "alice",
+            "aud": "my-aud",
+            "iss": "my-iss",
+        }));
+        assert!(auth.authenticate(&bearer(&t)).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn wrong_audience_rejected() {
+        let auth = JWTAuthenticator::new(SECRET).with_audience("expected-aud");
+        let t = token(&json!({ "sub": "alice", "aud": "other-aud" }));
+        assert!(auth.authenticate(&bearer(&t)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_issuer_rejected() {
+        let auth = JWTAuthenticator::new(SECRET).with_issuer("expected-iss");
+        let t = token(&json!({ "sub": "alice", "iss": "other-iss" }));
+        assert!(auth.authenticate(&bearer(&t)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn audience_not_required_when_unset() {
+        // No audience configured: a token carrying an `aud` claim is still fine.
+        let auth = JWTAuthenticator::new(SECRET);
+        let t = token(&json!({ "sub": "alice", "aud": "anything" }));
+        assert!(auth.authenticate(&bearer(&t)).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn algorithm_selection_rejects_other_family() {
+        // Token signed with HS256, but only HS384 allowed -> rejected.
+        let auth = JWTAuthenticator::new(SECRET).with_algorithms(vec![Algorithm::HS384]);
+        let t = token(&json!({ "sub": "alice" }));
+        assert!(auth.authenticate(&bearer(&t)).await.is_none());
     }
 
     #[tokio::test]
