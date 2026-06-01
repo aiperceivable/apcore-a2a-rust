@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A2A Explorer</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #f0f2f5;
+  color: #1a1a2e;
+  line-height: 1.6;
+}
+header {
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+  color: white;
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+header h1 { font-size: 1.4rem; font-weight: 600; }
+header .badge {
+  background: #e94560;
+  color: white;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.layout {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 0;
+  min-height: calc(100vh - 60px);
+}
+.sidebar {
+  background: white;
+  border-right: 1px solid #e2e8f0;
+  overflow-y: auto;
+  padding: 16px;
+}
+.main {
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.card {
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  overflow: hidden;
+}
+.card-header {
+  padding: 12px 16px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.card-header h2 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #334155;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.card-body { padding: 16px; }
+.info-grid { display: grid; gap: 8px; }
+.info-row {
+  display: flex;
+  gap: 8px;
+  font-size: 0.875rem;
+}
+.info-label {
+  font-weight: 600;
+  color: #64748b;
+  min-width: 100px;
+  flex-shrink: 0;
+}
+.info-value { color: #1e293b; word-break: break-all; }
+.cap-badge {
+  display: inline-block;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-size: 0.72rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-weight: 500;
+  margin: 2px;
+}
+.skill-item {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+.skill-summary {
+  padding: 10px 12px;
+  cursor: pointer;
+  background: #f8fafc;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  user-select: none;
+  list-style: none;
+}
+.skill-summary::-webkit-details-marker { display: none; }
+.skill-summary::before {
+  content: "▶";
+  font-size: 0.7rem;
+  color: #94a3b8;
+  transition: transform 0.15s;
+  display: inline-block;
+}
+details[open] .skill-summary::before { transform: rotate(90deg); }
+.skill-id {
+  font-family: monospace;
+  background: #e0e7ff;
+  color: #3730a3;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+.skill-name { color: #475569; }
+.skill-detail { padding: 12px; font-size: 0.82rem; color: #475569; border-top: 1px solid #e2e8f0; }
+.skill-detail p { margin-bottom: 6px; }
+.mode-badge {
+  display: inline-block;
+  background: #f0fdf4;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+  font-size: 0.72rem;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin: 2px;
+}
+.mode-badge.out {
+  background: #fdf4ff;
+  color: #7e22ce;
+  border-color: #e9d5ff;
+}
+pre.skill-json {
+  background: #1e293b;
+  color: #e2e8f0;
+  padding: 10px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  overflow-x: auto;
+  margin-top: 8px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.form-group { margin-bottom: 12px; }
+.form-group label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #475569;
+  margin-bottom: 4px;
+}
+select, input[type="text"], textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  font-family: inherit;
+  background: white;
+  color: #1e293b;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+select:focus, input[type="text"]:focus, textarea:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+}
+textarea {
+  resize: vertical;
+  min-height: 90px;
+  font-family: monospace;
+  font-size: 0.82rem;
+}
+.btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn {
+  padding: 8px 18px;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+.btn:hover { opacity: 0.88; }
+.btn:active { transform: scale(0.97); }
+.btn-primary { background: #6366f1; color: white; }
+.btn-stream { background: #0ea5e9; color: white; }
+.btn-danger { background: #ef4444; color: white; }
+.btn-neutral { background: #64748b; color: white; }
+pre.result-box {
+  background: #0f172a;
+  color: #94a3b8;
+  padding: 12px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  overflow-x: auto;
+  max-height: 280px;
+  overflow-y: auto;
+  margin-top: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre.result-box.has-content { color: #e2e8f0; }
+#sse-events {
+  min-height: 80px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: #0f172a;
+  border-radius: 6px;
+  padding: 10px;
+  font-size: 0.78rem;
+  color: #64748b;
+}
+.sse-event {
+  padding: 6px 8px;
+  border-bottom: 1px solid #1e293b;
+  color: #e2e8f0;
+}
+.sse-event:last-child { border-bottom: none; }
+.event-type {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 10px;
+  margin-right: 6px;
+  text-transform: uppercase;
+}
+.et-status { background: #1d4ed8; color: #bfdbfe; }
+.et-artifact { background: #166534; color: #bbf7d0; }
+.et-error { background: #991b1b; color: #fecaca; }
+.et-other { background: #374151; color: #d1d5db; }
+.state-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 700;
+  padding: 2px 10px;
+  border-radius: 12px;
+  margin-left: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.s-working { background: #fef9c3; color: #854d0e; }
+.s-completed { background: #dcfce7; color: #14532d; }
+.s-failed { background: #fee2e2; color: #7f1d1d; }
+.s-canceled { background: #f1f5f9; color: #475569; }
+.s-submitted { background: #ede9fe; color: #4c1d95; }
+.s-other { background: #e2e8f0; color: #334155; }
+.status-bar {
+  font-size: 0.8rem;
+  color: #64748b;
+  padding: 4px 0 0 0;
+  min-height: 20px;
+}
+.status-bar.err { color: #dc2626; }
+.loading { color: #94a3b8; font-style: italic; font-size: 0.82rem; }
+.auth-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  background: #e2e8f0;
+  border-bottom: 1px solid #cbd5e1;
+}
+.auth-bar label {
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: #475569;
+  white-space: nowrap;
+}
+.auth-bar input {
+  flex: 1;
+  font-family: monospace;
+  font-size: 0.8rem;
+  padding: 6px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: white;
+}
+.auth-bar input:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+}
+.auth-status {
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 12px;
+  white-space: nowrap;
+}
+.auth-locked { background: #dcfce7; color: #14532d; }
+.auth-unlocked { background: #fee2e2; color: #7f1d1d; }
+.curl-section { margin-top: 12px; }
+.curl-section .curl-label {
+  font-weight: 600;
+  font-size: 0.8rem;
+  color: #475569;
+  margin-bottom: 4px;
+  display: block;
+}
+.curl-block {
+  background: #1e293b;
+  color: #e2e8f0;
+  padding: 10px 50px 10px 12px;
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 0.75rem;
+  overflow-x: auto;
+  position: relative;
+}
+.copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: #334155;
+  color: #94a3b8;
+  border: 1px solid #475569;
+  border-radius: 4px;
+  padding: 2px 10px;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+.copy-btn:hover { background: #475569; color: #e2e8f0; }
+.example-link {
+  color: #4f46e5;
+  cursor: pointer;
+  text-decoration: underline;
+  font-size: 0.8rem;
+}
+.example-link:hover { color: #3730a3; }
+@media (max-width: 768px) {
+  .layout { grid-template-columns: 1fr; }
+  .sidebar { border-right: none; border-bottom: 1px solid #e2e8f0; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>APCore A2A Agent Explorer</h1>
+  <span class="badge">A2A</span>
+  <span id="agent-name-header" style="margin-left:auto;opacity:0.7;font-size:0.85rem;"></span>
+</header>
+
+<div class="auth-bar">
+  <label for="auth-token">Authorization</label>
+  <input type="password" id="auth-token" placeholder="Bearer eyJhbGci... (paste JWT token here)">
+  <span class="auth-status auth-unlocked" id="auth-status">No token</span>
+</div>
+
+<div class="layout">
+
+  <!-- Sidebar: Agent Card + Skills -->
+  <aside class="sidebar">
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-header"><h2>Agent Card</h2></div>
+      <div class="card-body">
+        <div id="card-info" class="info-grid">
+          <span class="loading">Loading…</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h2>Skills</h2>
+        <span id="skill-count" style="font-size:0.78rem;color:#94a3b8;"></span>
+      </div>
+      <div class="card-body" style="padding:8px;">
+        <div id="skills-list"><span class="loading">Loading…</span></div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- Main: Composer + SSE + Task Viewer -->
+  <main class="main">
+
+    <!-- Message Composer -->
+    <div class="card">
+      <div class="card-header"><h2>Message Composer</h2></div>
+      <div class="card-body">
+        <div class="form-group">
+          <label for="skill-select">Skill</label>
+          <select id="skill-select"></select>
+        </div>
+        <div class="form-group">
+          <label for="message-input">Message (text or JSON parts array)</label>
+          <textarea id="message-input" placeholder='Hello! or ["part1","part2"]'></textarea>
+        </div>
+        <div class="form-group">
+          <label for="context-id">Context ID</label>
+          <input type="text" id="context-id" placeholder="Auto-generated if empty">
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="sendMessage()">Send (message/send)</button>
+          <button class="btn btn-stream" onclick="streamMessage()">Stream (message/stream)</button>
+          <button class="btn btn-neutral" onclick="clearComposer()">Clear</button>
+        </div>
+        <div class="status-bar" id="composer-status"></div>
+        <pre class="result-box" id="send-result">— response will appear here —</pre>
+        <div id="send-curl"></div>
+      </div>
+    </div>
+
+    <!-- SSE Stream Viewer -->
+    <div class="card">
+      <div class="card-header">
+        <h2>SSE Stream Viewer</h2>
+        <button class="btn btn-neutral" style="font-size:0.75rem;padding:4px 10px;" onclick="clearSSE()">Clear</button>
+      </div>
+      <div class="card-body" style="padding:8px;">
+        <div id="sse-events"><span style="color:#4b5563;font-style:italic;font-size:0.82rem;">No stream events yet.</span></div>
+      </div>
+    </div>
+
+    <!-- Task State Viewer -->
+    <div class="card">
+      <div class="card-header"><h2>Task Viewer</h2></div>
+      <div class="card-body">
+        <div class="form-group">
+          <label for="task-id-input">Task ID</label>
+          <input type="text" id="task-id-input" placeholder="Enter task ID">
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="getTask()">Fetch (tasks/get)</button>
+          <button class="btn btn-danger" onclick="cancelTask()">Cancel (tasks/cancel)</button>
+        </div>
+        <div class="status-bar" id="task-status"></div>
+        <pre class="result-box" id="task-result">— task info will appear here —</pre>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script>
+"use strict";
+
+// Derive agent base URL and explorer prefix from window.location
+const EXPLORER_PREFIX = window.location.pathname.replace(/\/+$/, "");
+const AGENT_BASE = window.location.origin;
+
+let agentCard = null;
+let inputSchemas = {};
+let rpcId = 1;
+
+// ── Auth bar ────────────────────────────────────────────────────────────────
+
+const authInput = document.getElementById("auth-token");
+const authStatusEl = document.getElementById("auth-status");
+
+// Restore token from sessionStorage
+const savedToken = sessionStorage.getItem("auth_token");
+if (savedToken) authInput.value = savedToken;
+
+function updateAuthStatus() {
+  const token = authInput.value.trim();
+  if (token) {
+    authStatusEl.textContent = "Token set";
+    authStatusEl.className = "auth-status auth-locked";
+    sessionStorage.setItem("auth_token", token);
+  } else {
+    authStatusEl.textContent = "No token";
+    authStatusEl.className = "auth-status auth-unlocked";
+    sessionStorage.removeItem("auth_token");
+  }
+}
+authInput.addEventListener("input", updateAuthStatus);
+updateAuthStatus();
+
+// ── Bootstrap ────────────────────────────────────────────────────────────────
+
+async function init() {
+  try {
+    const res = await fetch(EXPLORER_PREFIX + "/agent-card");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    agentCard = await res.json();
+    inputSchemas = agentCard._inputSchemas || {};
+    renderCard(agentCard);
+    renderSkills(agentCard.skills || []);
+    populateSkillSelect(agentCard.skills || []);
+    document.getElementById("agent-name-header").textContent = agentCard.name || "";
+  } catch (e) {
+    document.getElementById("card-info").innerHTML =
+      `<span style="color:#dc2626">Failed to load agent card: ${esc(e.message)}</span>`;
+  }
+}
+
+// ── Render helpers ───────────────────────────────────────────────────────────
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderCard(card) {
+  const caps = card.capabilities || {};
+  const capBadges = Object.entries(caps)
+    .filter(([, v]) => v)
+    .map(([k]) => `<span class="cap-badge">${esc(k)}</span>`)
+    .join("");
+
+  document.getElementById("card-info").innerHTML = `
+    <div class="info-row">
+      <span class="info-label">Name</span>
+      <span class="info-value">${esc(card.name || "")}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Description</span>
+      <span class="info-value">${esc(card.description || "—")}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">Version</span>
+      <span class="info-value">${esc(card.version || "")}</span>
+    </div>
+    <div class="info-row">
+      <span class="info-label">URL</span>
+      <span class="info-value"><a href="${esc((card.supportedInterfaces && card.supportedInterfaces[0] && card.supportedInterfaces[0].url) || card.url || "#")}" target="_blank" rel="noopener noreferrer">${esc((card.supportedInterfaces && card.supportedInterfaces[0] && card.supportedInterfaces[0].url) || card.url || "")}</a></span>
+    </div>
+    ${capBadges ? `<div class="info-row"><span class="info-label">Capabilities</span><span class="info-value">${capBadges}</span></div>` : ""}
+  `;
+}
+
+function renderSkills(skills) {
+  document.getElementById("skill-count").textContent = skills.length + " skill" + (skills.length !== 1 ? "s" : "");
+  if (!skills.length) {
+    document.getElementById("skills-list").innerHTML = "<span style='color:#94a3b8;font-size:0.82rem;'>No skills defined.</span>";
+    return;
+  }
+  const html = skills.map(s => {
+    const inModes = (s.inputModes || []).map(m => `<span class="mode-badge">${esc(m)}</span>`).join("");
+    const outModes = (s.outputModes || []).map(m => `<span class="mode-badge out">${esc(m)}</span>`).join("");
+    const tags = (s.tags || []).map(t => `<span class="cap-badge">${esc(t)}</span>`).join("");
+    let displayExamples = (s.examples || []).slice(0, 5);
+    if (!displayExamples.length) {
+      const sample = sampleJsonForSkill(s.id);
+      if (sample) displayExamples = [sample];
+    }
+    const examplesHtml = displayExamples.length
+      ? `<p style="margin-top:6px;"><strong>Examples:</strong></p><ul style="margin-left:16px;font-size:0.8rem;">${displayExamples.map(e => `<li><span class="example-link" data-skill-id="${esc(s.id)}" data-example="${esc(String(e))}">${esc(String(e))}</span></li>`).join("")}</ul>`
+      : "";
+    const inputHint = displayExamples.length
+      ? `<p style="margin-top:4px;font-size:0.78rem;color:#64748b;">Click an example to try it →</p>`
+      : "";
+    return `
+      <details class="skill-item">
+        <summary class="skill-summary">
+          <span class="skill-id">${esc(s.id)}</span>
+          <span class="skill-name">${esc(s.name || s.id)}</span>
+        </summary>
+        <div class="skill-detail">
+          ${s.description ? `<p>${esc(s.description)}</p>` : ""}
+          ${tags ? `<p style="margin-top:4px;">${tags}</p>` : ""}
+          ${inModes ? `<p style="margin-top:6px;"><strong>Input:</strong> ${inModes}</p>` : ""}
+          ${examplesHtml}
+          ${inputHint}
+          ${outModes ? `<p style="margin-top:6px;"><strong>Output:</strong> ${outModes}</p>` : ""}
+          <pre class="skill-json">${esc(JSON.stringify(s, null, 2))}</pre>
+        </div>
+      </details>
+    `;
+  }).join("");
+  const container = document.getElementById("skills-list");
+  container.innerHTML = html;
+  if (!container._hasExampleClickListener) {
+    container.addEventListener("click", function(e) {
+      const link = e.target.closest(".example-link");
+      if (!link) return;
+      useExample(link.dataset.skillId, link.dataset.example);
+    });
+    container._hasExampleClickListener = true;
+  }
+}
+
+function populateSkillSelect(skills) {
+  const sel = document.getElementById("skill-select");
+  if (!skills.length) {
+    sel.innerHTML = `<option value="">— no skills —</option>`;
+    return;
+  }
+  sel.innerHTML = skills.map(s =>
+    `<option value="${esc(s.id)}">${esc(s.name || s.id)} (${esc(s.id)})</option>`
+  ).join("");
+  if (!sel._hasSkillChangeListener) {
+    sel.addEventListener("change", () => fillExampleForSkill(sel.value));
+    sel._hasSkillChangeListener = true;
+  }
+  fillExampleForSkill(sel.value);
+}
+
+function fillExampleForSkill(skillId) {
+  if (!agentCard) return;
+  const skill = (agentCard.skills || []).find(s => s.id === skillId);
+  if (!skill) return;
+  const input = document.getElementById("message-input");
+  const examples = skill.examples || [];
+  const firstExample = examples[0] || sampleJsonForSkill(skillId);
+  input.value = "";
+  if (firstExample) {
+    input.placeholder = "e.g. " + String(firstExample);
+  } else {
+    input.placeholder = "Enter a message for " + (skill.name || skill.id);
+  }
+}
+
+function useExample(skillId, example) {
+  const sel = document.getElementById("skill-select");
+  sel.value = skillId;
+  document.getElementById("message-input").value = example;
+  document.querySelector(".main").scrollTo({ top: 0, behavior: "smooth" });
+}
+
+// ── Schema helpers ─────────────────────────────────────────────────────────
+
+function sampleFromSchema(schema) {
+  if (!schema || !schema.properties) return null;
+  const obj = {};
+  for (const [key, prop] of Object.entries(schema.properties)) {
+    if ("default" in prop) {
+      obj[key] = prop["default"];
+    } else if (prop.type === "string") {
+      obj[key] = prop.description || key;
+    } else if (prop.type === "number" || prop.type === "integer") {
+      obj[key] = 0;
+    } else if (prop.type === "boolean") {
+      obj[key] = false;
+    } else {
+      obj[key] = key;
+    }
+  }
+  return obj;
+}
+
+function sampleJsonForSkill(skillId) {
+  const schema = inputSchemas[skillId];
+  if (!schema) return null;
+  const obj = sampleFromSchema(schema);
+  return obj ? JSON.stringify(obj, null, 2) : null;
+}
+
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+function generateId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return "id-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+}
+
+function getAuthHeaders() {
+  const token = authInput.value.trim();
+  if (!token) return {};
+  const bearer = token.toLowerCase().startsWith("bearer ") ? token : "Bearer " + token;
+  return { "Authorization": bearer };
+}
+
+function buildMessageParams(skillId, text, contextId) {
+  let parts;
+  try {
+    const parsed = JSON.parse(text);
+    parts = Array.isArray(parsed) ? parsed : [{ kind: "text", text }];
+  } catch {
+    parts = [{ kind: "text", text }];
+  }
+  return {
+    message: {
+      messageId: generateId(),
+      role: "user",
+      parts,
+      metadata: { skillId },
+      contextId,
+    }
+  };
+}
+
+function nextId() { return rpcId++; }
+
+function escShellSingleQuote(s) {
+  return s.replace(/'/g, "'\\''");
+}
+
+function buildCurlCommand(body) {
+  const bodyStr = JSON.stringify(body);
+  const token = authInput.value.trim();
+  let cmd = `curl -X POST '${escShellSingleQuote(AGENT_BASE)}/' \\\n  -H 'Content-Type: application/json'`;
+  if (token) {
+    const bearer = token.toLowerCase().startsWith("bearer ") ? token : "Bearer " + token;
+    cmd += ` \\\n  -H 'Authorization: ${escShellSingleQuote(bearer)}'`;
+  }
+  cmd += ` \\\n  -d '${escShellSingleQuote(bodyStr)}'`;
+  return cmd;
+}
+
+function renderCurl(parentEl, body) {
+  const cmd = buildCurlCommand(body);
+  const section = document.createElement("div");
+  section.className = "curl-section";
+  section.innerHTML = `
+    <span class="curl-label">cURL</span>
+    <div class="curl-block"><pre class="curl-cmd" style="margin:0;font:inherit;color:inherit;white-space:pre-wrap;word-break:break-word;">${esc(cmd)}</pre><button class="copy-btn">Copy</button></div>
+  `;
+  parentEl.appendChild(section);
+  section.querySelector(".copy-btn").onclick = function() {
+    const btn = this;
+    navigator.clipboard.writeText(cmd).then(() => {
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    }).catch(() => {
+      btn.textContent = "Failed";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    });
+  };
+}
+
+function setStatus(elemId, msg, isErr) {
+  const el = document.getElementById(elemId);
+  el.textContent = msg;
+  el.className = "status-bar" + (isErr ? " err" : "");
+}
+
+function setResult(elemId, data) {
+  const el = document.getElementById(elemId);
+  el.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  el.className = "result-box has-content";
+}
+
+function taskStateBadge(state) {
+  const map = {
+    working: "s-working", completed: "s-completed", failed: "s-failed",
+    canceled: "s-canceled", submitted: "s-submitted",
+  };
+  const cls = map[state] || "s-other";
+  return `<span class="state-badge ${cls}">${esc(state || "unknown")}</span>`;
+}
+
+// ── Message Composer ─────────────────────────────────────────────────────────
+
+async function sendMessage() {
+  const skillId = document.getElementById("skill-select").value;
+  const text = document.getElementById("message-input").value.trim();
+  const contextId = document.getElementById("context-id").value.trim() || generateId();
+  if (!text) { setStatus("composer-status", "Message cannot be empty.", true); return; }
+
+  setStatus("composer-status", "Sending…");
+  const body = {
+    jsonrpc: "2.0",
+    id: nextId(),
+    method: "message/send",
+    params: buildMessageParams(skillId, text, contextId),
+  };
+
+  try {
+    const res = await fetch(AGENT_BASE + "/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    setResult("send-result", data);
+    // If the response contains a task ID, populate the task viewer
+    const taskId = data?.result?.id || data?.result?.task?.id;
+    if (taskId) {
+      document.getElementById("task-id-input").value = taskId;
+      setStatus("composer-status", "Sent. Task ID: " + taskId);
+    } else {
+      setStatus("composer-status", "Sent. Status: " + res.status);
+    }
+  } catch (e) {
+    setStatus("composer-status", "Error: " + e.message, true);
+    setResult("send-result", "Error: " + e.message);
+  } finally {
+    // Always show cURL command — useful for debugging even when response fails
+    const curlContainer = document.getElementById("send-curl");
+    curlContainer.innerHTML = "";
+    renderCurl(curlContainer, body);
+  }
+}
+
+function streamMessage() {
+  const skillId = document.getElementById("skill-select").value;
+  const text = document.getElementById("message-input").value.trim();
+  const contextId = document.getElementById("context-id").value.trim() || generateId();
+  if (!text) { setStatus("composer-status", "Message cannot be empty.", true); return; }
+
+  setStatus("composer-status", "Streaming…");
+  const body = {
+    jsonrpc: "2.0",
+    id: nextId(),
+    method: "message/stream",
+    params: buildMessageParams(skillId, text, contextId),
+  };
+
+  const eventsDiv = document.getElementById("sse-events");
+  eventsDiv.innerHTML = "<span style='color:#60a5fa;font-style:italic;font-size:0.82rem;'>Stream started…</span>";
+
+  fetch(AGENT_BASE + "/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+    body: JSON.stringify(body),
+  }).then(res => {
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    function parseSSEBlocks(raw) {
+      const blocks = raw.split("\n\n");
+      const remainder = blocks.pop();
+      for (const block of blocks) {
+        const lines = block.split("\n");
+        let eventType = "message";
+        let dataStr = "";
+        for (const line of lines) {
+          if (line.startsWith("event:")) eventType = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+        }
+        if (dataStr) appendSSEEvent(eventType, dataStr);
+      }
+      return remainder;
+    }
+
+    function readChunk() {
+      reader.read().then(({ done, value }) => {
+        if (done) {
+          if (buffer.trim()) parseSSEBlocks(buffer + "\n\n");
+          setStatus("composer-status", "Stream complete.");
+          return;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        buffer = parseSSEBlocks(buffer);
+        readChunk();
+      }).catch(e => {
+        setStatus("composer-status", "Stream error: " + e.message, true);
+      });
+    }
+    readChunk();
+  }).catch(e => {
+    setStatus("composer-status", "Stream error: " + e.message, true);
+    eventsDiv.innerHTML = `<span style="color:#f87171;">Error: ${esc(e.message)}</span>`;
+  });
+}
+
+function appendSSEEvent(type, dataStr) {
+  const eventsDiv = document.getElementById("sse-events");
+  // Remove placeholder
+  const placeholder = eventsDiv.querySelector("span");
+  if (placeholder) placeholder.remove();
+
+  let parsed = null;
+  try { parsed = JSON.parse(dataStr); } catch {}
+
+  const typeCls = type === "message" || type === "status" ? "et-status"
+    : type === "artifact" ? "et-artifact"
+    : type === "error" ? "et-error"
+    : "et-other";
+
+  const div = document.createElement("div");
+  div.className = "sse-event";
+
+  // Extract state for badge
+  const state = parsed?.result?.status?.state || parsed?.status?.state;
+  const stateBadge = state ? taskStateBadge(state) : "";
+  const taskId = parsed?.result?.id || parsed?.id;
+
+  if (taskId && !document.getElementById("task-id-input").value) {
+    document.getElementById("task-id-input").value = taskId;
+  }
+
+  div.innerHTML = `
+    <span class="event-type ${typeCls}">${esc(type)}</span>
+    ${stateBadge}
+    <span style="color:#94a3b8;font-size:0.72rem;margin-left:6px;">${new Date().toLocaleTimeString()}</span>
+    <pre style="margin-top:4px;color:#cbd5e1;font-size:0.75rem;white-space:pre-wrap;word-break:break-word;">${esc(parsed ? JSON.stringify(parsed, null, 2) : dataStr)}</pre>
+  `;
+  eventsDiv.appendChild(div);
+  eventsDiv.scrollTop = eventsDiv.scrollHeight;
+}
+
+function clearSSE() {
+  document.getElementById("sse-events").innerHTML =
+    "<span style='color:#4b5563;font-style:italic;font-size:0.82rem;'>Cleared.</span>";
+}
+
+function clearComposer() {
+  document.getElementById("message-input").value = "";
+  document.getElementById("context-id").value = "";
+  document.getElementById("send-result").textContent = "— response will appear here —";
+  document.getElementById("send-result").className = "result-box";
+  document.getElementById("send-curl").innerHTML = "";
+  setStatus("composer-status", "");
+}
+
+// ── Task Viewer ──────────────────────────────────────────────────────────────
+
+async function getTask() {
+  const taskId = document.getElementById("task-id-input").value.trim();
+  if (!taskId) { setStatus("task-status", "Enter a task ID.", true); return; }
+
+  setStatus("task-status", "Fetching…");
+  const body = {
+    jsonrpc: "2.0",
+    id: nextId(),
+    method: "tasks/get",
+    params: { id: taskId },
+  };
+
+  try {
+    const res = await fetch(AGENT_BASE + "/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    setResult("task-result", data);
+    const state = data?.result?.status?.state;
+    setStatus("task-status", state ? "State: " + state : "Fetched.");
+  } catch (e) {
+    setStatus("task-status", "Error: " + e.message, true);
+    setResult("task-result", "Error: " + e.message);
+  }
+}
+
+async function cancelTask() {
+  const taskId = document.getElementById("task-id-input").value.trim();
+  if (!taskId) { setStatus("task-status", "Enter a task ID.", true); return; }
+
+  setStatus("task-status", "Canceling…");
+  const body = {
+    jsonrpc: "2.0",
+    id: nextId(),
+    method: "tasks/cancel",
+    params: { id: taskId },
+  };
+
+  try {
+    const res = await fetch(AGENT_BASE + "/", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    setResult("task-result", data);
+    setStatus("task-status", "Cancel request sent.");
+  } catch (e) {
+    setStatus("task-status", "Error: " + e.message, true);
+    setResult("task-result", "Error: " + e.message);
+  }
+}
+
+// ── Keyboard shortcuts ───────────────────────────────────────────────────────
+
+document.addEventListener("keydown", function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    const focused = document.activeElement;
+    if (focused && focused.id === "message-input") {
+      e.preventDefault();
+      sendMessage();
+    }
+  }
+});
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+
+init().catch(console.error);
+</script>
+</body>
+</html>

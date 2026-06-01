@@ -1,0 +1,55 @@
+[package]
+name = "apcore-a2a"
+version = "0.4.0"
+edition = "2021"
+description = "A2A protocol adapter for apcore — expose apcore modules as A2A agents"
+license = "Apache-2.0"
+readme = "README.md"
+authors = ["aiperceivable <tercel.yi@gmail.com>"]
+homepage = "https://aiperceivable.com"
+repository = "https://github.com/aiperceivable/apcore-a2a-rust"
+documentation = "https://apcore.aiperceivable.com/"
+keywords = ["ai", "a2a", "agent", "apcore", "protocol"]
+categories = ["api-bindings", "asynchronous", "web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+apcore = "0.22"
+apcore-toolkit = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+jsonwebtoken = "9"
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+hyper = { version = "1", features = ["full"] }
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio-stream = "0.1"
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+
+[[bin]]
+name = "apcore-a2a"
+path = "src/bin/apcore-a2a.rs"
+
+[[example]]
+name = "run"
+path = "examples/run/main.rs"
