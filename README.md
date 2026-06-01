@@ -90,8 +90,9 @@ use apcore_a2a::{JWTAuthenticator, ClaimMapping};
 
 let auth = JWTAuthenticator::new("your-secret-key")
     .with_claim_mapping(ClaimMapping {
-        id_claim: "sub".to_string(),
-        roles_claim: "roles".to_string(),
+        id_claim: "sub".into(),
+        roles_claim: "roles".into(),
+        ..Default::default()
     });
 ```
 
@@ -106,7 +107,7 @@ let auth = JWTAuthenticator::new("your-secret-key")
 | **Skill name** | `metadata.display.a2a.alias` or humanized `module_id` |
 | **Skill desc** | `metadata.display.a2a.description` or `module.description` |
 | **Skill tags** | `metadata.display.tags` or `module.tags`  |
-| **Task**       | Managed execution of `Executor.call_async()` |
+| **Task**       | Managed execution via `ApCoreAgentExecutor::call` / `stream_channel` |
 | **Security**   | Bridged to apcore's `Identity` context    |
 
 ### Module Structure
