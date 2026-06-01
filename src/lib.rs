@@ -38,4 +38,4 @@ pub use crate::adapters::{
 };
 
 // Re-exports: client
-pub use crate::client::{A2AClient, AgentCardFetcher};
+pub use crate::client::{A2AClient, A2AClientError, AgentCardFetcher, ClientResult};

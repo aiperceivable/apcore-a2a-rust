@@ -69,13 +69,23 @@ async fn main() {
 
 ```rust
 use apcore_a2a::A2AClient;
+use serde_json::json;
 
 #[tokio::main]
 async fn main() {
     let client = A2AClient::new("http://remote-agent:8000");
 
+    // `message` is an A2A message object; `metadata.skillId` selects the module.
     let task = client
-        .send_message("my.skill", "Hello from Rust!")
+        .send_message(
+            json!({
+                "messageId": "m1",
+                "role": "ROLE_USER",
+                "parts": [{ "data": { "name": "Tercel" } }]
+            }),
+            Some(json!({ "skillId": "demo.greet" })),
+            None, // optional contextId
+        )
         .await
         .unwrap();
 
