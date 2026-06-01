@@ -69,8 +69,15 @@ impl ErrorMapper {
 }
 
 fn sanitize_message(message: &str) -> String {
-    let re = regex::Regex::new(r"~?/\S*").unwrap();
-    let cleaned = re.replace_all(message, "");
+    // Match Unix absolute paths (single or multi-component) and ~ paths.
+    let path_re = regex::Regex::new(r"~?/\S*").unwrap();
+    let cleaned = path_re.replace_all(message, "");
+    // Strip traceback lines (kept in sync with Python/TypeScript bindings).
+    let tb_re = regex::Regex::new(r#"(?m)^.*(?:Traceback|File "|line \d+).*$"#).unwrap();
+    let cleaned = tb_re.replace_all(&cleaned, "");
+    // Collapse internal whitespace.
+    let ws_re = regex::Regex::new(r"\s+").unwrap();
+    let cleaned = ws_re.replace_all(&cleaned, " ");
     let cleaned = cleaned.trim();
     // Char-boundary-safe truncation: slicing by byte index (`cleaned[..500]`)
     // panics when byte 500 lands inside a multibyte UTF-8 char.
@@ -155,6 +162,24 @@ mod tests {
     fn test_sanitize_strips_paths() {
         let msg = sanitize_message("error at /home/user/secret/file.py line 42");
         assert!(!msg.contains("/home"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_tracebacks() {
+        let msg = sanitize_message(
+            "boom\nTraceback (most recent call last):\nFile \"x.rs\", line 42, in foo\nactual error",
+        );
+        assert!(!msg.contains("Traceback"));
+        assert!(!msg.contains("File \""));
+        assert!(!msg.contains("line 42"));
+        assert!(msg.contains("boom"));
+        assert!(msg.contains("actual error"));
+    }
+
+    #[test]
+    fn test_sanitize_collapses_whitespace() {
+        let msg = sanitize_message("a\n\n   b\t\tc");
+        assert_eq!(msg, "a b c");
     }
 
     #[test]
