@@ -27,11 +27,15 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 - **Full task lifecycle** — submitted, working, completed, failed, canceled, input-required
 - **JWT authentication** — tokens bridged to apcore's Identity context
 - **Built-in client** — `A2AClient` for calling remote A2A agents
-- **CLI support** — `apcore-a2a serve` for zero-code startup
+- **SSE streaming** — `message/stream` server-sent events; `A2AClient::stream_message` on the client
+- **Push notifications** — `tasks/pushNotificationConfig/{set,get,delete}` with webhook delivery
+- **CLI support** — `apcore-a2a --extensions-dir ./extensions` for zero-code startup
 - **Pluggable storage** — `TaskStore` trait for custom backends
 - **Observability** — `/health` endpoint
-- **Config Bus** — registers `apcore-a2a` namespace with `APCORE_A2A` env prefix (apcore 0.15.1)
+- **Config Bus** — registers `apcore-a2a` namespace with `APCORE_A2A` env prefix (apcore 0.22)
 - **Error Formatter Registry** — registers A2A error formatter with apcore ecosystem (§8.8)
+
+> **Note:** Metrics (`/metrics`) are Python/TypeScript-only — the Rust crate does not serve a `/metrics` endpoint. SSE streaming (`message/stream`) and push notifications (`tasks/pushNotificationConfig/*`) are fully supported.
 
 ## Requirements
 
@@ -129,7 +133,7 @@ src/
   server/      A2AServerFactory, ApCoreAgentExecutor
   client/      A2AClient, AgentCardFetcher
   storage/     TaskStore trait, InMemoryTaskStore
-  explorer/    (planned)
+  explorer/    Explorer UI HTML + card handler
   apcore_a2a.rs  APCoreA2A builder, serve(), async_serve()
   cli.rs       CLI entrypoint
 ```

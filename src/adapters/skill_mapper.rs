@@ -23,7 +23,15 @@ impl SkillMapper {
         Self::default()
     }
 
-    pub fn map(
+    /// Map a module descriptor to an [`AgentSkill`].
+    ///
+    /// Precondition: the caller ([`AgentCardBuilder`](super::agent_card::AgentCardBuilder))
+    /// guarantees `description` is non-empty and non-whitespace. Unlike Python/TS
+    /// `to_skill` (which returns an `Option` and skips empty-description modules),
+    /// this does not itself skip empty-description modules — the empty-description
+    /// filter lives in the builder. The `Option` refactor is intentionally
+    /// deferred (no observable behavior change).
+    pub fn to_skill(
         &self,
         module_id: &str,
         descriptor: &ModuleDescriptor,
@@ -104,13 +112,16 @@ impl SkillMapper {
         }
     }
 
-    /// Build up to 10 example titles from the descriptor's examples (skip empties).
+    /// Build up to 10 example titles from the descriptor's examples.
+    ///
+    /// Empty titles are skipped, but whitespace-only titles are kept (no trim)
+    /// to match Python/TS, which only filter strictly empty strings.
     fn build_examples(&self, descriptor: &ModuleDescriptor) -> Vec<String> {
         descriptor
             .examples
             .iter()
             .take(10)
-            .filter(|ex| !ex.title.trim().is_empty())
+            .filter(|ex| !ex.title.is_empty())
             .map(|ex| ex.title.clone())
             .collect()
     }
@@ -135,17 +146,35 @@ fn str_field(value: &Value, key: &str) -> Option<String> {
 }
 
 fn humanize_id(id: &str) -> String {
-    id.replace(['.', '_', '-'], " ")
-        .split_whitespace()
-        .map(|w| {
-            let mut chars = w.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+    // Only '.' and '_' become word separators; hyphens are preserved as
+    // characters (e.g. "foo-bar" → "Foo-Bar"), matching the spec
+    // `_humanize_module_id` and Python `.title()` / TS `\b\w → toUpperCase`:
+    // the first alphanumeric of every run (after any non-alphanumeric boundary,
+    // including a hyphen) is capitalized; other characters are left as-is.
+    let mut out = String::with_capacity(id.len());
+    let mut at_boundary = true;
+    for ch in id.chars() {
+        if ch == '.' || ch == '_' {
+            // Separators collapse to a single space; the following char starts
+            // a new word. Avoid emitting leading/duplicate spaces.
+            if !out.ends_with(' ') && !out.is_empty() {
+                out.push(' ');
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            at_boundary = true;
+        } else if ch.is_alphanumeric() {
+            if at_boundary {
+                out.extend(ch.to_uppercase());
+            } else {
+                out.push(ch);
+            }
+            at_boundary = false;
+        } else {
+            // Preserved punctuation (e.g. '-') is a word boundary but stays.
+            out.push(ch);
+            at_boundary = true;
+        }
+    }
+    out.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -180,7 +209,7 @@ mod tests {
             "display".to_string(),
             json!({ "a2a": { "alias": "Resize Image" } }),
         );
-        let skill = SkillMapper::new().map("image.resize", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("image.resize", &d, "raw description");
         assert_eq!(skill.name, "Resize Image");
     }
 
@@ -189,15 +218,26 @@ mod tests {
         let mut d = descriptor("image.resize");
         d.metadata
             .insert("display".to_string(), json!({ "alias": "Shrinker" }));
-        let skill = SkillMapper::new().map("image.resize", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("image.resize", &d, "raw description");
         assert_eq!(skill.name, "Shrinker");
     }
 
     #[test]
     fn name_humanized_without_overlay() {
         let d = descriptor("image.resize");
-        let skill = SkillMapper::new().map("image.resize", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("image.resize", &d, "raw description");
         assert_eq!(skill.name, "Image Resize");
+    }
+
+    #[test]
+    fn hyphen_preserved_when_humanizing_id() {
+        // Regression (A-D-011): only '.' and '_' become spaces; the hyphen is
+        // preserved as a character (not turned into a space → no "Foo Bar").
+        // Matching Python `.title()` / TS `\b\w`, the letter after the hyphen is
+        // still capitalized, so "foo-bar" → "Foo-Bar".
+        let d = descriptor("foo-bar");
+        let skill = SkillMapper::new().to_skill("foo-bar", &d, "raw description");
+        assert_eq!(skill.name, "Foo-Bar");
     }
 
     #[test]
@@ -207,7 +247,7 @@ mod tests {
             "display".to_string(),
             json!({ "a2a": { "description": "Does X", "guidance": "Use carefully" } }),
         );
-        let skill = SkillMapper::new().map("x.y", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("x.y", &d, "raw description");
         assert_eq!(skill.description, "Does X\n\nGuidance: Use carefully");
     }
 
@@ -216,7 +256,7 @@ mod tests {
         let mut d = descriptor("x.y");
         d.metadata
             .insert("display".to_string(), json!({ "tags": ["a", "b"] }));
-        let skill = SkillMapper::new().map("x.y", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("x.y", &d, "raw description");
         assert_eq!(skill.tags, vec!["a".to_string(), "b".to_string()]);
     }
 
@@ -225,7 +265,7 @@ mod tests {
         let mut d = descriptor("x.y");
         d.metadata
             .insert("display".to_string(), json!({ "tags": [] }));
-        let skill = SkillMapper::new().map("x.y", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("x.y", &d, "raw description");
         assert_eq!(skill.tags, vec!["t1".to_string()]);
     }
 
@@ -234,7 +274,7 @@ mod tests {
         let mut d = descriptor("x.y");
         d.input_schema = Value::Null;
         d.output_schema = Value::Null;
-        let skill = SkillMapper::new().map("x.y", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("x.y", &d, "raw description");
         assert_eq!(skill.input_modes, vec!["text/plain".to_string()]);
         assert_eq!(skill.output_modes, vec!["text/plain".to_string()]);
     }
@@ -243,7 +283,7 @@ mod tests {
     fn string_root_input_yields_json_and_text() {
         let mut d = descriptor("x.y");
         d.input_schema = json!({ "type": "string" });
-        let skill = SkillMapper::new().map("x.y", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("x.y", &d, "raw description");
         assert_eq!(
             skill.input_modes,
             vec!["application/json".to_string(), "text/plain".to_string()]
@@ -253,7 +293,7 @@ mod tests {
     #[test]
     fn object_schema_yields_json_modes() {
         let d = descriptor("x.y");
-        let skill = SkillMapper::new().map("x.y", &d, "raw description");
+        let skill = SkillMapper::new().to_skill("x.y", &d, "raw description");
         assert_eq!(skill.input_modes, vec!["application/json".to_string()]);
         assert_eq!(skill.output_modes, vec!["application/json".to_string()]);
     }
@@ -271,11 +311,12 @@ mod tests {
             .unwrap()
         };
         let mut d = descriptor("x.y");
-        d.examples = vec![ex("First"), ex(""), ex("Second")]; // empty title skipped
-        let skill = SkillMapper::new().map("x.y", &d, "raw description");
+        // Strictly-empty title skipped; whitespace-only title kept (Python/TS parity).
+        d.examples = vec![ex("First"), ex(""), ex("  "), ex("Second")];
+        let skill = SkillMapper::new().to_skill("x.y", &d, "raw description");
         assert_eq!(
             skill.examples,
-            vec!["First".to_string(), "Second".to_string()]
+            vec!["First".to_string(), "  ".to_string(), "Second".to_string()]
         );
     }
 }

@@ -26,11 +26,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::adapters::errors::ErrorMapper;
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::storage::TaskStore;
 use crate::types::{
-    Artifact, Message, StreamEvent, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
+    Message, StreamEvent, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
     TaskStatusUpdateEvent,
 };
 
@@ -116,10 +115,12 @@ fn error_to_status(err: &ModuleError) -> TaskStatus {
             TaskState::Failed,
             Message::agent_text("Execution timed out"),
         ),
-        _ => {
-            let mapped = ErrorMapper::to_jsonrpc_error(err);
-            TaskStatus::with_message(TaskState::Failed, Message::agent_text(mapped.message))
-        }
+        // Unknown/generic errors emit a fixed message rather than leaking the
+        // internal error text (Python/TS parity).
+        _ => TaskStatus::with_message(
+            TaskState::Failed,
+            Message::agent_text("Internal server error"),
+        ),
     }
 }
 
@@ -243,6 +244,12 @@ async fn handle_send(
 
     let cancel = CancelToken::new();
     register_cancel(state, &task_id, cancel.clone());
+    // Unregister the cancel token on every exit path (success, error, panic);
+    // a Drop guard mirrors handle_stream and avoids leaking the token.
+    let _cancel_guard = CancelGuard {
+        state: state.clone(),
+        task_id: task_id.clone(),
+    };
 
     let _ = state
         .task_store
@@ -253,12 +260,14 @@ async fn handle_send(
         .executor
         .call(&skill_id, inputs, identity, cancel)
         .await;
-    unregister_cancel(state, &task_id);
 
     match result {
         Ok(output) => {
-            let parts = state.executor.part_converter().convert_result(&output);
-            task.artifacts = vec![Artifact::new(format!("art-{task_id}"), parts)];
+            let artifact = state
+                .executor
+                .part_converter()
+                .output_to_parts(&output, &task_id);
+            task.artifacts = vec![artifact];
             task.status = TaskStatus::new(TaskState::Completed);
         }
         Err(err) => {
@@ -355,7 +364,6 @@ async fn handle_stream(
         }))
         .await;
 
-        let artifact_id = format!("art-{task_id}");
         let mut chunks = state2
             .executor
             .stream_channel(skill_id, inputs, identity, cancel);
@@ -365,11 +373,16 @@ async fn handle_stream(
         while let Some(item) = chunks.next().await {
             match item {
                 Ok(chunk) => {
-                    let parts = state2.executor.part_converter().convert_result(&chunk);
+                    // task_id is always a fresh uuid here, so the artifact id is
+                    // stable (`art-{task_id}`) across chunks.
+                    let artifact = state2
+                        .executor
+                        .part_converter()
+                        .output_to_parts(&chunk, &task_id);
                     send(StreamEvent::ArtifactUpdate(TaskArtifactUpdateEvent {
                         task_id: task_id.clone(),
                         context_id: context_id.clone(),
-                        artifact: Artifact::new(artifact_id.clone(), parts),
+                        artifact,
                         append: idx > 0,
                         last_chunk: false,
                     }))
@@ -587,5 +600,47 @@ struct CancelGuard {
 impl Drop for CancelGuard {
     fn drop(&mut self) {
         unregister_cancel(&self.state, &self.task_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Part;
+
+    /// Extract the status message's text (if any).
+    fn status_text(status: &TaskStatus) -> Option<String> {
+        status.message.as_ref().and_then(|m| {
+            m.parts.iter().find_map(|p| match p {
+                Part::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn generic_error_yields_fixed_internal_server_error_message() {
+        // Regression (A-D-015): the unknown/generic error arm must emit a fixed
+        // "Internal server error" message, never leaking the raw internal error
+        // text (Python/TS parity).
+        let err = ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            "super secret internal detail leaking through",
+        );
+        let status = error_to_status(&err);
+        assert_eq!(status.state, TaskState::Failed);
+        assert_eq!(
+            status_text(&status).as_deref(),
+            Some("Internal server error")
+        );
+    }
+
+    #[test]
+    fn timeout_error_keeps_specific_message() {
+        // The specific arms are unchanged: timeout still maps to its own message.
+        let err = ModuleError::new(ErrorCode::ModuleTimeout, "ignored");
+        let status = error_to_status(&err);
+        assert_eq!(status.state, TaskState::Failed);
+        assert_eq!(status_text(&status).as_deref(), Some("Execution timed out"));
     }
 }

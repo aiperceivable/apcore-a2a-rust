@@ -172,7 +172,10 @@ async fn stream_message_yields_terminal_event() {
         }
     }
     assert!(count > 0, "expected at least one SSE event");
-    assert!(saw_terminal, "expected a terminal TASK_STATE_COMPLETED event");
+    assert!(
+        saw_terminal,
+        "expected a terminal TASK_STATE_COMPLETED event"
+    );
 }
 
 #[tokio::test]

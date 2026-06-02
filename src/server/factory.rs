@@ -69,7 +69,9 @@ impl A2AServerFactory {
             streaming: true,
             push_notifications: false,
             extensions: vec![],
-            extended_agent_card: false,
+            // Extended agent card is offered when an authenticator is configured
+            // (Python/TS parity: extended_agent_card = auth is not None).
+            extended_agent_card: auth.is_some(),
         };
 
         let agent_card = self.agent_card_builder.build(
@@ -136,11 +138,12 @@ impl A2AServerFactory {
 
         // Apply auth middleware (if configured). Discovery + health stay public.
         if let Some(authenticator) = auth {
+            // Note: a `/metrics` endpoint is not yet implemented in the Rust SDK
+            // (Python/TS-only), so it is intentionally absent from this list.
             let exempt = vec![
                 "/.well-known/agent-card.json".to_string(),
                 "/.well-known/agent.json".to_string(),
                 "/health".to_string(),
-                "/metrics".to_string(),
             ];
             router = router.layer(AuthMiddlewareLayer::new(authenticator, exempt));
         }

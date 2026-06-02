@@ -182,11 +182,7 @@ impl A2AClient {
     }
 
     /// List tasks via `tasks/list`.
-    pub async fn list_tasks(
-        &self,
-        context_id: Option<String>,
-        limit: i64,
-    ) -> ClientResult<Value> {
+    pub async fn list_tasks(&self, context_id: Option<String>, limit: i64) -> ClientResult<Value> {
         let mut params = json!({ "limit": limit });
         if let Some(cid) = context_id {
             params["contextId"] = Value::String(cid);

@@ -21,6 +21,10 @@ pub struct ErrorMapper;
 
 impl ErrorMapper {
     pub fn to_jsonrpc_error(error: &ModuleError) -> JsonRpcError {
+        // Log the full, unsanitized error server-side for diagnostics before any
+        // sanitization (matches Python's `logger.error(..., exc_info=True)`).
+        tracing::error!(error = ?error, "apcore error mapped to A2A JSON-RPC error");
+
         let code = error.code;
 
         match code {
@@ -100,8 +104,11 @@ pub struct A2aErrorFormatter;
 
 impl ApcoreErrorFormatter for A2aErrorFormatter {
     fn format(&self, error: &ModuleError, _context: Option<&dyn std::any::Any>) -> Value {
-        serde_json::to_value(ErrorMapper::to_jsonrpc_error(error))
-            .unwrap_or_else(|_| error.to_dict())
+        serde_json::to_value(ErrorMapper::to_jsonrpc_error(error)).unwrap_or_else(|_| {
+            // Never fall back to the raw apcore error (it may leak unsanitized
+            // detail); return a hardcoded sanitized generic error instead.
+            serde_json::json!({ "code": -32603, "message": "Internal server error" })
+        })
     }
 }
 
@@ -220,7 +227,7 @@ mod tests {
     fn test_sanitize_truncation_multibyte_no_panic() {
         // 600 multibyte chars (3 bytes each in UTF-8) => 1800 bytes, with a
         // char straddling byte boundary 500. A naive `cleaned[..500]` would panic.
-        let input: String = "あ".repeat(600);
+        let input: String = "\u{3042}".repeat(600);
         let out = sanitize_message(&input);
         assert!(out.chars().count() <= 500);
         assert_eq!(out.chars().count(), 500);

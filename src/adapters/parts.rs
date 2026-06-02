@@ -1,9 +1,10 @@
 //! PartConverter — converts between A2A 1.0 Parts and apcore module I/O.
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::schema::SchemaConverter;
-use crate::types::Part;
+use crate::types::{Artifact, Part};
 
 /// Re-exported for backward compatibility; the canonical type is [`crate::types::Part`].
 pub use crate::types::Part as A2aPart;
@@ -33,6 +34,24 @@ impl PartConverter {
             Value::Null => vec![],
             other => vec![Part::text(other.to_string())],
         }
+    }
+
+    /// Convert apcore module output into an A2A 1.0 [`Artifact`].
+    ///
+    /// Wraps [`convert_result`](Self::convert_result) and assigns the artifact id
+    /// `art-{task_id}`, falling back to `art-{uuid}` when `task_id` is empty
+    /// (matches Python `art-{task_id or uuid4()}` and the TS adapter).
+    pub fn output_to_parts(&self, output: &Value, task_id: &str) -> Artifact {
+        let parts = self.convert_result(output);
+        let artifact_id = format!(
+            "art-{}",
+            if task_id.is_empty() {
+                Uuid::new_v4().to_string()
+            } else {
+                task_id.to_string()
+            }
+        );
+        Artifact::new(artifact_id, parts)
     }
 
     /// Convert an inbound A2A message's Parts into apcore module input.
@@ -99,6 +118,22 @@ mod tests {
         // not a data Part.
         let out = conv().convert_result(&json!([1, 2, 3]));
         assert_eq!(out, vec![Part::text("[1,2,3]")]);
+    }
+
+    #[test]
+    fn output_to_parts_uses_task_id() {
+        let art = conv().output_to_parts(&json!("hi"), "t1");
+        assert_eq!(art.artifact_id, "art-t1");
+        assert_eq!(art.parts, vec![Part::text("hi")]);
+    }
+
+    #[test]
+    fn output_to_parts_empty_task_id_uses_uuid_fallback() {
+        let art = conv().output_to_parts(&json!("hi"), "");
+        assert!(art.artifact_id.starts_with("art-"));
+        // The uuid fallback must produce a non-empty id beyond the "art-" prefix.
+        assert!(art.artifact_id.len() > "art-".len());
+        assert_ne!(art.artifact_id, "art-");
     }
 
     #[test]

@@ -74,7 +74,10 @@ impl Module for GreetModule {
     }
 
     async fn execute(&self, inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
-        let name = inputs.get("name").and_then(Value::as_str).unwrap_or("world");
+        let name = inputs
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("world");
         Ok(json!({ "greeting": format!("Hello, {name}!") }))
     }
 }

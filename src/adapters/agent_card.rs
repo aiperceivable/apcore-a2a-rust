@@ -1,5 +1,7 @@
 //! AgentCardBuilder — builds an A2A 1.0 Agent Card from an apcore Registry.
 
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -69,11 +71,17 @@ pub struct AgentSkill {
 /// Builds an [`AgentCard`] from an apcore Registry.
 pub struct AgentCardBuilder {
     skill_mapper: SkillMapper,
+    /// Cached card populated by [`get_cached_or_build`](Self::get_cached_or_build);
+    /// interior mutability lets the builder cache behind a shared `&self`.
+    cache: Mutex<Option<AgentCard>>,
 }
 
 impl AgentCardBuilder {
     pub fn new(skill_mapper: SkillMapper) -> Self {
-        Self { skill_mapper }
+        Self {
+            skill_mapper,
+            cache: Mutex::new(None),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -100,11 +108,11 @@ impl AgentCardBuilder {
                     tracing::warn!("Skipping module {module_id}: missing description");
                     return None;
                 }
-                Some(self.skill_mapper.map(module_id, &def, &desc))
+                Some(self.skill_mapper.to_skill(module_id, &def, &desc))
             })
             .collect();
 
-        AgentCard {
+        let card = AgentCard {
             name: name.to_string(),
             description: description.to_string(),
             version: version.to_string(),
@@ -125,6 +133,151 @@ impl AgentCardBuilder {
             security_schemes: security_schemes.unwrap_or_else(|| Value::Object(Default::default())),
             security_requirements: vec![],
             signatures: vec![],
+        };
+
+        // Populate the cache (Python/TS parity): a direct build() makes the card
+        // available to a subsequent get_cached_or_build(). The lock is taken only
+        // here, after the (potentially slow) card construction completes, so it is
+        // never held across the build work.
+        *self.cache.lock().unwrap() = Some(card.clone());
+        card
+    }
+
+    /// Build the extended Agent Card (Python/TS parity).
+    ///
+    /// The extended card is a deep clone of `base_card`. apcore exposes no extra
+    /// authenticated-only fields today, so this mirrors the base card; the method
+    /// exists for cross-language API parity and future enrichment.
+    pub fn build_extended(&self, base_card: &AgentCard) -> AgentCard {
+        base_card.clone()
+    }
+
+    /// Return the cached Agent Card if present, otherwise build it, cache it, and
+    /// return the freshly built card (Python/TS parity).
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_cached_or_build(
+        &self,
+        registry: &Registry,
+        name: &str,
+        description: &str,
+        version: &str,
+        url: &str,
+        capabilities: AgentCapabilities,
+        security_schemes: Option<Value>,
+    ) -> AgentCard {
+        // Check the cache first; the lock is released before delegating to
+        // build() (which does its own locking) to avoid holding the lock across
+        // the build call.
+        if let Some(cached) = self.cache.lock().unwrap().clone() {
+            return cached;
         }
+        // build() caches the freshly built card itself.
+        self.build(
+            registry,
+            name,
+            description,
+            version,
+            url,
+            capabilities,
+            security_schemes,
+        )
+    }
+
+    /// Invalidate the cached Agent Card (Python/TS parity).
+    pub fn invalidate_cache(&self) {
+        *self.cache.lock().unwrap() = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apcore::context::Context;
+    use apcore::errors::ModuleError;
+    use apcore::module::Module;
+    use apcore::registry::registry::Registry;
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    struct EchoModule;
+
+    #[async_trait]
+    impl Module for EchoModule {
+        fn input_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn output_schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        fn description(&self) -> &str {
+            "Echoes its inputs"
+        }
+        async fn execute(
+            &self,
+            inputs: Value,
+            _ctx: &Context<Value>,
+        ) -> Result<Value, ModuleError> {
+            Ok(inputs)
+        }
+    }
+
+    fn echo_registry() -> Registry {
+        let registry = Registry::new();
+        registry
+            .register_module("test.echo", Box::new(EchoModule))
+            .expect("register echo module");
+        registry
+    }
+
+    fn capabilities() -> AgentCapabilities {
+        AgentCapabilities {
+            streaming: true,
+            push_notifications: false,
+            extensions: vec![],
+            extended_agent_card: false,
+        }
+    }
+
+    fn build_card(builder: &AgentCardBuilder, registry: &Registry) -> AgentCard {
+        builder.build(
+            registry,
+            "Agent",
+            "An agent",
+            "1.0.0",
+            "http://localhost",
+            capabilities(),
+            None,
+        )
+    }
+
+    #[test]
+    fn build_populates_cache_for_subsequent_get() {
+        // Regression (A-D-018): a direct build() must populate the cache so a
+        // following get_cached_or_build() returns that same cached card, rather
+        // than rebuilding (Python/TS parity).
+        let registry = echo_registry();
+        let builder = AgentCardBuilder::new(SkillMapper::new());
+
+        let built = build_card(&builder, &registry);
+
+        // The cache now holds the built card.
+        let cached = builder.cache.lock().unwrap().clone();
+        assert!(cached.is_some(), "build() must populate the cache");
+
+        // get_cached_or_build returns the cached instance (same skills/name),
+        // not a fresh build.
+        let from_cache = builder.get_cached_or_build(
+            &registry,
+            "DIFFERENT",
+            "different",
+            "9.9.9",
+            "http://other",
+            capabilities(),
+            None,
+        );
+        // Despite different args, the cached card (from build) is returned.
+        assert_eq!(from_cache.name, built.name);
+        assert_eq!(from_cache.version, built.version);
+        assert_eq!(from_cache.name, "Agent");
     }
 }

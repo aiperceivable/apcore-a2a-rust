@@ -187,8 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn require_auth_false_permits_downstream() {
-        let layer =
-            AuthMiddlewareLayer::with_require_auth(Arc::new(AlwaysNone), vec![], false);
+        let layer = AuthMiddlewareLayer::with_require_auth(Arc::new(AlwaysNone), vec![], false);
         let svc = layer.layer(ok_service());
         let req = Request::builder()
             .uri("/jsonrpc")
@@ -201,10 +200,8 @@ mod tests {
 
     #[tokio::test]
     async fn exempt_path_skips_auth() {
-        let layer = AuthMiddlewareLayer::new(
-            Arc::new(AlwaysNone),
-            vec!["/.well-known/".to_string()],
-        );
+        let layer =
+            AuthMiddlewareLayer::new(Arc::new(AlwaysNone), vec!["/.well-known/".to_string()]);
         let svc = layer.layer(ok_service());
         let req = Request::builder()
             .uri("/.well-known/agent-card.json")
