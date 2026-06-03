@@ -112,9 +112,18 @@ where
             match authenticator.authenticate(&headers).await {
                 None => {
                     if require_auth {
+                        // JSON body + headers match Python/TS middleware so clients
+                        // get a consistent error shape across all three SDKs.
+                        let body = serde_json::json!({
+                            "error": "Unauthorized",
+                            "detail": "Missing or invalid Bearer token",
+                        })
+                        .to_string();
                         let resp = Response::builder()
                             .status(401)
-                            .body(axum::body::Body::from("Unauthorized"))
+                            .header("content-type", "application/json")
+                            .header("www-authenticate", "Bearer")
+                            .body(axum::body::Body::from(body))
                             .unwrap();
                         Ok(resp)
                     } else {
@@ -183,6 +192,34 @@ mod tests {
             .unwrap();
         let resp = svc.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn rejection_401_body_is_json_matching_python_ts() {
+        // Regression (D11-002): the 401 response must be a JSON body with
+        // content-type + WWW-Authenticate headers, matching the Python/TS
+        // middleware — not a bare plain-text "Unauthorized".
+        let layer = AuthMiddlewareLayer::new(Arc::new(AlwaysNone), vec![]);
+        let svc = layer.layer(ok_service());
+        let req = Request::builder()
+            .uri("/jsonrpc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        assert_eq!(resp.headers().get("www-authenticate").unwrap(), "Bearer");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "Unauthorized");
+        assert_eq!(json["detail"], "Missing or invalid Bearer token");
     }
 
     #[tokio::test]
