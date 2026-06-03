@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-03
+
+### Added
+
+- Conformance test suite (`tests/conformance.rs`) mirroring the shared cross-language fixtures.
+- `LICENSE` (Apache-2.0).
+
+### Fixed
+
+- Auth middleware now returns a JSON 401 body `{"error","detail"}` with `content-type: application/json` and a `WWW-Authenticate: Bearer` header, matching the Python/TypeScript middleware (previously a bare plain-text `Unauthorized` body — clients parsing the error body broke against the Rust server only).
+- `AgentCardBuilder::build` now takes `extended_agent_card` from the caller's `capabilities` instead of deriving it from `security_schemes.is_some()` (Python/TypeScript parity; matters for custom authenticators that return no security schemes).
+
+### Changed
+
+- A missing `metadata.skillId` (or an unconvertible part set) now surfaces as a **FAILED task** instead of a JSON-RPC error, matching Python/TypeScript and the existing unknown-skill path.
+- `securitySchemes` are served in the A2A 1.0 proto3 `oneof` shape.
+
 ## [0.4.0] - 2026-06-01
 
 Initial release — A2A 1.0 protocol adapter for apcore (Rust), at full feature
