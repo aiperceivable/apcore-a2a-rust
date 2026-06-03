@@ -12,7 +12,7 @@ pub mod server;
 pub mod storage;
 pub mod types;
 
-pub const VERSION: &str = "0.4.1";
+pub const VERSION: &str = "0.4.0";
 
 // Re-exports: core bridge
 pub use crate::apcore_a2a::{
