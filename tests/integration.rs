@@ -72,6 +72,23 @@ async fn post_rpc(router: axum::Router, body: Value) -> (StatusCode, Value) {
     (status, body_json(resp).await)
 }
 
+/// POST a `message/stream` request and collect the SSE `data:` frames as JSON.
+async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    text.lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+        .collect()
+}
+
 #[tokio::test]
 async fn agent_card_is_a2a_1_0_shape() {
     let req = Request::builder()
@@ -152,8 +169,10 @@ async fn message_send_executes_and_completes() {
 }
 
 #[tokio::test]
-async fn message_send_missing_skill_id_is_invalid_params() {
-    let (_status, resp) = post_rpc(
+async fn message_send_missing_skill_id_yields_failed_task() {
+    // A-D-303: a missing metadata.skillId now produces a FAILED task (matching
+    // Python/TS and the unknown-skill path), not a JSON-RPC -32602 error.
+    let (status, resp) = post_rpc(
         build().await,
         json!({
             "jsonrpc": "2.0",
@@ -163,7 +182,96 @@ async fn message_send_missing_skill_id_is_invalid_params() {
         }),
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        resp.get("error").is_none(),
+        "expected a task, not an error: {resp:?}"
+    );
+    let task = &resp["result"];
+    assert_eq!(task["status"]["state"], json!("TASK_STATE_FAILED"));
+    assert_eq!(
+        task["status"]["message"]["parts"][0]["text"],
+        json!("Missing required parameter: metadata.skillId")
+    );
+}
+
+#[tokio::test]
+async fn message_send_missing_message_is_invalid_params() {
+    // A genuinely missing message envelope remains a protocol-level -32602 error
+    // (no task context exists to fail) — distinct from missing skillId.
+    let (_status, resp) = post_rpc(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "3",
+            "method": "message/send",
+            "params": { "metadata": { "skillId": "test.echo" } }
+        }),
+    )
+    .await;
     assert_eq!(resp["error"]["code"], json!(-32602));
+}
+
+#[tokio::test]
+async fn message_stream_emits_terminal_last_chunk_marker() {
+    // A-D-301: a successful stream emits a final artifactUpdate with lastChunk=true
+    // (art-{taskId}, empty parts) before the terminal COMPLETED status.
+    let events = collect_sse(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "s1",
+            "method": "message/stream",
+            "params": {
+                "message": { "messageId": "m", "role": "ROLE_USER", "parts": [{ "data": { "x": 1 } }] },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await;
+
+    let last_chunk_idx = events
+        .iter()
+        .position(|e| e["artifactUpdate"]["lastChunk"] == json!(true));
+    let completed_idx = events
+        .iter()
+        .position(|e| e["statusUpdate"]["status"]["state"] == json!("TASK_STATE_COMPLETED"));
+    assert!(
+        last_chunk_idx.is_some(),
+        "expected a lastChunk=true artifactUpdate, got: {events:?}"
+    );
+    assert!(completed_idx.is_some(), "expected a COMPLETED statusUpdate");
+    assert!(
+        last_chunk_idx < completed_idx,
+        "lastChunk marker must precede COMPLETED: {events:?}"
+    );
+    let marker = &events[last_chunk_idx.unwrap()]["artifactUpdate"];
+    assert!(marker["artifact"]["artifactId"]
+        .as_str()
+        .unwrap()
+        .starts_with("art-"));
+    assert_eq!(marker["artifact"]["parts"], json!([]));
+}
+
+#[tokio::test]
+async fn message_stream_missing_skill_id_yields_failed_task_events() {
+    // A-D-303 (streaming): a streamed request with no skillId emits SUBMITTED then
+    // a terminal FAILED status over SSE — not a JSON-RPC error.
+    let events = collect_sse(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "s2",
+            "method": "message/stream",
+            "params": { "message": { "messageId": "m", "role": "ROLE_USER", "parts": [{ "text": "hi" }] } }
+        }),
+    )
+    .await;
+    let states: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e["statusUpdate"]["status"]["state"].as_str())
+        .collect();
+    assert_eq!(states, vec!["TASK_STATE_SUBMITTED", "TASK_STATE_FAILED"]);
 }
 
 #[tokio::test]

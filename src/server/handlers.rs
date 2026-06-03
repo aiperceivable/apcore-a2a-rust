@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::storage::TaskStore;
 use crate::types::{
-    Message, StreamEvent, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
+    Artifact, Message, StreamEvent, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
     TaskStatusUpdateEvent,
 };
 
@@ -168,21 +168,33 @@ pub async fn jsonrpc_handler(
     }
 }
 
+/// Outcome of a failed request parse.
+///
+/// A missing/invalid `message` envelope is a protocol error (`Rpc`) with no task.
+/// A missing `metadata.skillId` or an unconvertible Part set is a task-level
+/// failure (`Task`) that must surface as a FAILED task — matching Python/TS and
+/// Rust's own unknown-skill path (which already emits a FAILED task).
+enum ParseFailure {
+    Rpc(i32, String),
+    Task {
+        task_id: String,
+        context_id: String,
+        message: String,
+    },
+}
+
 /// Parse the inbound message + skillId + inputs shared by send/stream.
 fn parse_request(
     state: &AppState,
     params: &Value,
-) -> Result<(String, String, String, Value), (i32, String)> {
-    let skill_id = skill_id_of(params).ok_or((
-        CODE_INVALID_PARAMS,
-        "Missing required parameter: metadata.skillId".to_string(),
-    ))?;
-
+) -> Result<(String, String, String, Value), ParseFailure> {
+    // The message envelope is required at the protocol level: without it there is
+    // no task context to fail (Python/TS reach the executor only with a message).
     let message: Message = params
         .get("message")
         .cloned()
         .and_then(|m| serde_json::from_value(m).ok())
-        .ok_or((
+        .ok_or(ParseFailure::Rpc(
             CODE_INVALID_PARAMS,
             "Missing or invalid parameter: message".to_string(),
         ))?;
@@ -193,13 +205,98 @@ fn parse_request(
         .clone()
         .unwrap_or_else(|| task_id.clone());
 
+    // From here, failures are task-level: a missing skillId or unconvertible parts
+    // produce a FAILED task (not a JSON-RPC error), matching Python/TS.
+    let skill_id = skill_id_of(params).ok_or_else(|| ParseFailure::Task {
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        message: "Missing required parameter: metadata.skillId".to_string(),
+    })?;
+
     let inputs = state
         .executor
         .part_converter()
         .parts_to_input(&message.parts, None)
-        .map_err(|e| (CODE_INVALID_PARAMS, e))?;
+        .map_err(|e| ParseFailure::Task {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            message: e,
+        })?;
 
     Ok((skill_id, task_id, context_id, inputs))
+}
+
+/// Build, persist, and webhook-notify a terminal FAILED task; returns its JSON.
+/// Shared by the missing-skillId / unparseable-parts / unknown-skill paths so all
+/// task-level failures produce an identical FAILED task shape (Python/TS parity).
+async fn fail_task(
+    state: &AppState,
+    task_id: &str,
+    context_id: &str,
+    message: impl Into<String>,
+) -> Value {
+    let status = TaskStatus::with_message(TaskState::Failed, Message::agent_text(message));
+    let task = Task {
+        id: task_id.to_string(),
+        context_id: context_id.to_string(),
+        status: status.clone(),
+        artifacts: vec![],
+        history: vec![],
+    };
+    let task_json = serde_json::to_value(&task).unwrap();
+    let _ = state.task_store.save(task_id, task_json.clone()).await;
+    notify_push(
+        state,
+        task_id,
+        &StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: task_id.to_string(),
+            context_id: context_id.to_string(),
+            status,
+        }),
+    );
+    task_json
+}
+
+/// Emit a task-level failure as an SSE stream (SUBMITTED then terminal FAILED),
+/// mirroring how a normal stream surfaces task state. Used when a streamed request
+/// has a missing skillId or unconvertible parts (Python/TS parity).
+async fn failed_task_stream(
+    state: &AppState,
+    task_id: String,
+    context_id: String,
+    message: String,
+) -> Response {
+    let status = TaskStatus::with_message(TaskState::Failed, Message::agent_text(message));
+    let task = Task {
+        id: task_id.clone(),
+        context_id: context_id.clone(),
+        status: status.clone(),
+        artifacts: vec![],
+        history: vec![],
+    };
+    let _ = state
+        .task_store
+        .save(&task_id, serde_json::to_value(&task).unwrap())
+        .await;
+    let terminal = StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+        task_id: task_id.clone(),
+        context_id: context_id.clone(),
+        status,
+    });
+    notify_push(state, &task_id, &terminal);
+    let events = vec![
+        StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: task_id.clone(),
+            context_id: context_id.clone(),
+            status: TaskStatus::new(TaskState::Submitted),
+        }),
+        terminal,
+    ];
+    let event_stream = tokio_stream::iter(events)
+        .map(|ev| Ok::<Event, Infallible>(Event::default().json_data(&ev).unwrap_or_default()));
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 fn submitted_task(task_id: &str, context_id: &str) -> Task {
@@ -218,29 +315,28 @@ async fn handle_send(
     identity: Option<Identity>,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    let (skill_id, task_id, context_id, inputs) = parse_request(state, params)?;
-
-    let mut task = submitted_task(&task_id, &context_id);
+    let (skill_id, task_id, context_id, inputs) = match parse_request(state, params) {
+        Ok(v) => v,
+        Err(ParseFailure::Rpc(code, msg)) => return Err((code, msg)),
+        Err(ParseFailure::Task {
+            task_id,
+            context_id,
+            message,
+        }) => return Ok(fail_task(state, &task_id, &context_id, message).await),
+    };
 
     // Reject unknown skills with a FAILED task (Python/TS parity).
     if !state.skill_ids.contains(&skill_id) {
-        task.status = TaskStatus::with_message(
-            TaskState::Failed,
-            Message::agent_text(format!("Skill not found: {skill_id}")),
-        );
-        let task_json = serde_json::to_value(&task).unwrap();
-        let _ = state.task_store.save(&task_id, task_json.clone()).await;
-        notify_push(
+        return Ok(fail_task(
             state,
             &task_id,
-            &StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
-                task_id: task_id.clone(),
-                context_id: context_id.clone(),
-                status: task.status.clone(),
-            }),
-        );
-        return Ok(task_json);
+            &context_id,
+            format!("Skill not found: {skill_id}"),
+        )
+        .await);
     }
+
+    let mut task = submitted_task(&task_id, &context_id);
 
     let cancel = CancelToken::new();
     register_cancel(state, &task_id, cancel.clone());
@@ -299,7 +395,14 @@ async fn handle_stream(
 ) -> Response {
     let (skill_id, task_id, context_id, inputs) = match parse_request(state, params) {
         Ok(v) => v,
-        Err((code, msg)) => return Json(rpc_error(&id, code, &msg)).into_response(),
+        Err(ParseFailure::Rpc(code, msg)) => {
+            return Json(rpc_error(&id, code, &msg)).into_response()
+        }
+        Err(ParseFailure::Task {
+            task_id,
+            context_id,
+            message,
+        }) => return failed_task_stream(state, task_id, context_id, message).await,
     };
 
     let cancel = CancelToken::new();
@@ -394,6 +497,21 @@ async fn handle_stream(
                     break;
                 }
             }
+        }
+
+        // On successful completion, emit a terminal empty-artifact marker
+        // (last_chunk=true, art-{task_id}) before the COMPLETED status — required
+        // by the A2A streaming contract (streaming.md "Final chunk: lastChunk=True")
+        // and matching Python/TS. Errors skip the marker and go straight to FAILED.
+        if error.is_none() {
+            send(StreamEvent::ArtifactUpdate(TaskArtifactUpdateEvent {
+                task_id: task_id.clone(),
+                context_id: context_id.clone(),
+                artifact: Artifact::new(format!("art-{task_id}"), vec![]),
+                append: idx > 0,
+                last_chunk: true,
+            }))
+            .await;
         }
 
         let final_status = match &error {

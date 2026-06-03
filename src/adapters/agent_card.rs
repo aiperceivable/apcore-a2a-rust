@@ -68,6 +68,43 @@ pub struct AgentSkill {
     pub security_requirements: Vec<Value>,
 }
 
+/// Convert a flat security-scheme value (the shape `JWTAuthenticator::security_schemes()`
+/// returns, e.g. `{"type":"http","scheme":...,"bearerFormat":...}`) into the A2A 1.0
+/// protobuf-JSON `oneof` shape served by the reference a2a-sdk, e.g.
+/// `{"httpAuthSecurityScheme":{"scheme":...,"bearerFormat":...}}`. Keeps the served
+/// `securitySchemes` byte-identical across the Python/TS/Rust SDKs (the proto3 JSON
+/// mapping is the canonical A2A 1.0 wire shape; the flat OpenAPI-style form is not).
+fn to_a2a_security_schemes(schemes: Option<Value>) -> Value {
+    let Some(Value::Object(map)) = schemes else {
+        return Value::Object(serde_json::Map::new());
+    };
+    let out: serde_json::Map<String, Value> = map
+        .into_iter()
+        .map(|(key, scheme)| (key, to_a2a_security_scheme(&scheme)))
+        .collect();
+    Value::Object(out)
+}
+
+fn to_a2a_security_scheme(scheme: &Value) -> Value {
+    if scheme.get("type").and_then(Value::as_str) == Some("http") {
+        let mut http = serde_json::Map::new();
+        let scheme_name = scheme
+            .get("scheme")
+            .and_then(Value::as_str)
+            .unwrap_or("bearer");
+        http.insert("scheme".to_string(), Value::String(scheme_name.to_string()));
+        // proto3 JSON omits empty fields; only emit bearerFormat when present.
+        if let Some(fmt) = scheme.get("bearerFormat").and_then(Value::as_str) {
+            if !fmt.is_empty() {
+                http.insert("bearerFormat".to_string(), Value::String(fmt.to_string()));
+            }
+        }
+        return serde_json::json!({ "httpAuthSecurityScheme": http });
+    }
+    // Unknown scheme types map to an empty SecurityScheme (matches the Python builder).
+    Value::Object(serde_json::Map::new())
+}
+
 /// Builds an [`AgentCard`] from an apcore Registry.
 pub struct AgentCardBuilder {
     skill_mapper: SkillMapper,
@@ -123,14 +160,16 @@ impl AgentCardBuilder {
                 tenant: String::new(),
             }],
             provider: None,
-            capabilities: AgentCapabilities {
-                extended_agent_card: security_schemes.is_some(),
-                ..capabilities
-            },
+            // `extended_agent_card` is decided by the caller, not derived from
+            // `security_schemes`. The factory sets it to `auth.is_some()`
+            // (Python/TS parity). Deriving it from `security_schemes.is_some()`
+            // would diverge for a custom Authenticator that returns null schemes
+            // while auth is configured.
+            capabilities,
             skills,
             default_input_modes: vec!["text/plain".to_string(), "application/json".to_string()],
             default_output_modes: vec!["text/plain".to_string(), "application/json".to_string()],
-            security_schemes: security_schemes.unwrap_or_else(|| Value::Object(Default::default())),
+            security_schemes: to_a2a_security_schemes(security_schemes),
             security_requirements: vec![],
             signatures: vec![],
         };
@@ -198,6 +237,24 @@ mod tests {
     use apcore::registry::registry::Registry;
     use async_trait::async_trait;
     use serde_json::json;
+
+    #[test]
+    fn security_schemes_use_a2a_oneof_shape() {
+        // A-D-201: the flat {type:"http",...} input is transformed into the proto3
+        // `httpAuthSecurityScheme` oneof shape (canonical A2A 1.0, byte-identical to
+        // the Python a2a-sdk's served card).
+        let input = Some(json!({
+            "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }
+        }));
+        assert_eq!(
+            to_a2a_security_schemes(input),
+            json!({
+                "bearerAuth": { "httpAuthSecurityScheme": { "scheme": "bearer", "bearerFormat": "JWT" } }
+            })
+        );
+        // None / empty input -> empty object (no schemes).
+        assert_eq!(to_a2a_security_schemes(None), json!({}));
+    }
 
     struct EchoModule;
 
@@ -279,5 +336,53 @@ mod tests {
         assert_eq!(from_cache.name, built.name);
         assert_eq!(from_cache.version, built.version);
         assert_eq!(from_cache.name, "Agent");
+    }
+
+    #[test]
+    fn build_respects_caller_extended_agent_card_not_security_schemes() {
+        // Regression (D10-001): extended_agent_card must come from the caller's
+        // capabilities (the factory sets it to `auth.is_some()`, Python/TS
+        // parity), NOT from `security_schemes.is_some()`. A custom Authenticator
+        // can configure auth while returning no security_schemes.
+        let registry = echo_registry();
+        let builder = AgentCardBuilder::new(SkillMapper::new());
+
+        // auth configured (extended=true) but no security schemes → must stay true.
+        let caps_true = AgentCapabilities {
+            extended_agent_card: true,
+            ..capabilities()
+        };
+        let card = builder.build(
+            &registry,
+            "Agent",
+            "An agent",
+            "1.0.0",
+            "http://localhost",
+            caps_true,
+            None,
+        );
+        assert!(
+            card.capabilities.extended_agent_card,
+            "caller's extended_agent_card=true must be preserved when security_schemes is None"
+        );
+
+        // no auth (extended=false) but security schemes present → must stay false.
+        let caps_false = AgentCapabilities {
+            extended_agent_card: false,
+            ..capabilities()
+        };
+        let card = builder.build(
+            &registry,
+            "Agent",
+            "An agent",
+            "1.0.0",
+            "http://localhost",
+            caps_false,
+            Some(serde_json::json!({"bearer": {"type": "http"}})),
+        );
+        assert!(
+            !card.capabilities.extended_agent_card,
+            "caller's extended_agent_card=false must be preserved when security_schemes is Some"
+        );
     }
 }
