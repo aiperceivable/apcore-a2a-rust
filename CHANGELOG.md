@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-06-25
+
+Patch release. Bumps apcore to 0.25.0 and apcore-toolkit to 0.9.1. No code or API changes; all 106 tests pass unmodified against the new runtime.
+
+### Changed
+
+- Dependency bump: `apcore = "0.25"` (from `"0.24"`) and `apcore-toolkit = "0.9.1"` (from `"0.8.1"`). The adapter's public surface is unaffected by the 0.24 → 0.25 delta.
+
+  apcore 0.25.0 and apcore-toolkit 0.9.0–0.9.1 changes reviewed for adapter impact — none required a change:
+  - **Config-driven ACL discovery (0.25.0, apcore #74)** — auto-wired during `APCore` construction, but skipped when the caller supplies its own `Executor` (as the adapter does); an explicitly configured ACL is never clobbered. No behavior change for the adapter.
+  - **Registry module-id constants promoted to the public surface (0.25.0, apcore #30)** — export-surface-only addition; no behavior change.
+  - **apcore-toolkit OpenAPI parser hardening (0.9.0–0.9.1)** — robustness fixes with no public API change; the adapter uses only `deep_resolve_refs`, which is unaffected.
+
+
 ## [0.4.1] - 2026-06-15
 
 Patch release. Bumps apcore to 0.24.0 and apcore-toolkit to 0.8.1. No code or API changes; all 106 tests pass unmodified against the new runtime.
