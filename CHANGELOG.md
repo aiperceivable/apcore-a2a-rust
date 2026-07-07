@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-07-07
+update package dependency version for apcore-toolkit (0.10.0) and increment project patch version
+
 ## [0.4.2] - 2026-06-25
 
 Patch release. Bumps apcore to 0.25.0 and apcore-toolkit to 0.9.1. No code or API changes; all 106 tests pass unmodified against the new runtime.
