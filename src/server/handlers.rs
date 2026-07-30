@@ -79,8 +79,49 @@ pub async fn explorer_html() -> Html<&'static str> {
 }
 
 /// Serve the Explorer's agent card (with `_inputSchemas`).
-pub async fn explorer_card(State(state): State<AppState>) -> Json<Value> {
-    Json((*state.explorer_card).clone())
+pub async fn explorer_card(
+    State(state): State<AppState>,
+    AuthIdentity(identity): AuthIdentity,
+) -> Json<Value> {
+    Json(acl_filtered_card(
+        &state.explorer_card,
+        &state,
+        identity.as_ref(),
+    ))
+}
+
+/// Remove from a card the skills the caller is not allowed to invoke.
+///
+/// The ACL gated the call but not the advertisement, so a deny-all-but-one ACL
+/// still listed every module — telling a caller about capabilities it will
+/// always be refused, and disclosing the module inventory of a locked-down
+/// deployment. This is the same masking principle as srs FR-ERR-003, applied to
+/// discovery: what a caller may not invoke, it is not told about.
+///
+/// No ACL configured is the common case and costs nothing: the cached card is
+/// returned as-is.
+pub(crate) fn acl_filtered_card(
+    card: &Value,
+    state: &AppState,
+    identity: Option<&Identity>,
+) -> Value {
+    let Some(acl) = state.executor.acl() else {
+        return card.clone();
+    };
+    // apcore maps a `None` caller to `@external`, so an anonymous discovery
+    // request is evaluated under the same rule an anonymous call would hit.
+    let caller = identity.map(Identity::id);
+
+    let mut filtered = card.clone();
+    if let Some(skills) = filtered.get_mut("skills").and_then(Value::as_array_mut) {
+        skills.retain(|skill| {
+            skill
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| acl.check(caller, id, None))
+        });
+    }
+    filtered
 }
 
 /// Extracts the authenticated apcore `Identity` from request extensions, if the

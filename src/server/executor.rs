@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use apcore::acl::ACL;
 use apcore::cancel::CancelToken;
 use apcore::context::{Context, Identity};
 use apcore::errors::{ErrorCode, ModuleError};
@@ -42,6 +43,12 @@ impl ApCoreAgentExecutor {
 
     pub fn part_converter(&self) -> &PartConverter {
         &self.part_converter
+    }
+
+    /// The apcore ACL backing this executor, if one is configured. Lets the
+    /// Agent Card advertise only the skills a caller is allowed to invoke.
+    pub fn acl(&self) -> Option<Arc<ACL>> {
+        self.executor.acl.clone()
     }
 
     /// Build an apcore `Context` carrying the cancel token and a global

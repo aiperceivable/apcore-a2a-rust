@@ -19,7 +19,8 @@ use crate::auth::middleware::AuthMiddlewareLayer;
 use crate::auth::protocol::Authenticator;
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::server::handlers::{
-    explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler, AppState,
+    acl_filtered_card, explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler,
+    AppState, AuthIdentity,
 };
 use crate::storage::TaskStore;
 
@@ -169,8 +170,15 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy" }))
 }
 
-async fn serve_card(State(state): State<AppState>) -> Json<Value> {
-    Json((*state.agent_card).clone())
+async fn serve_card(
+    State(state): State<AppState>,
+    AuthIdentity(identity): AuthIdentity,
+) -> Json<Value> {
+    Json(acl_filtered_card(
+        &state.agent_card,
+        &state,
+        identity.as_ref(),
+    ))
 }
 
 fn register_a2a_namespace() {

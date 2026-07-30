@@ -99,15 +99,22 @@ where
 
         Box::pin(async move {
             let mut req = req;
-            if exempt {
-                return inner.call(req).await;
-            }
-
             let headers: HashMap<String, String> = req
                 .headers()
                 .iter()
                 .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                 .collect();
+
+            // Exempt paths (discovery, health) are never rejected, but a caller
+            // that does present valid credentials is still identified: the Agent
+            // Card is ACL-filtered per caller, so serving it anonymously to an
+            // authenticated client would hide skills that client may invoke.
+            if exempt {
+                if let Some(identity) = authenticator.authenticate(&headers).await {
+                    req.extensions_mut().insert(identity);
+                }
+                return inner.call(req).await;
+            }
 
             match authenticator.authenticate(&headers).await {
                 None => {

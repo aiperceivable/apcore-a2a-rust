@@ -208,6 +208,64 @@ async fn agent_card_version_tracks_crate_version() {
 }
 
 #[tokio::test]
+async fn agent_card_advertises_only_acl_allowed_skills() {
+    // The ACL gated the call but not the advertisement, so a deny-all-but-one
+    // ACL still listed every module.
+    use apcore::acl::{ACLRule, ACL};
+    use apcore::config::Config;
+    use apcore::executor::Executor;
+
+    let acl = ACL::new(
+        vec![ACLRule {
+            callers: vec!["*".into()],
+            targets: vec!["test.echo".into()],
+            effect: "allow".into(),
+            description: None,
+            conditions: None,
+        }],
+        "deny",
+        None,
+    );
+    let mut executor = Executor::new(echo_registry(), Config::default());
+    executor.set_acl(acl);
+
+    let (router, _card) = build_app(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+    )
+    .await
+    .expect("build app");
+
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .body(Body::empty())
+        .unwrap();
+    let card = body_json(router.oneshot(req).await.unwrap()).await;
+
+    let ids: Vec<&str> = card["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["test.echo"],
+        "only the ACL-allowed skill may be advertised"
+    );
+}
+
+#[tokio::test]
+async fn agent_card_is_unfiltered_when_no_acl_is_configured() {
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .body(Body::empty())
+        .unwrap();
+    let card = body_json(build().await.oneshot(req).await.unwrap()).await;
+    assert_eq!(card["skills"].as_array().map(Vec::len), Some(4));
+}
+
+#[tokio::test]
 async fn agent_json_alias_served() {
     let req = Request::builder()
         .uri("/.well-known/agent.json")
