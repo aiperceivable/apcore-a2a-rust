@@ -12,7 +12,12 @@ pub mod server;
 pub mod storage;
 pub mod types;
 
-pub const VERSION: &str = "0.4.1";
+/// Crate version, taken from `Cargo.toml` at compile time.
+///
+/// Derived rather than hand-maintained: a literal drifts from the packaged
+/// version on every release and is then reported on the Agent Card and by
+/// `apcore-a2a --version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Re-exports: core bridge
 pub use crate::apcore_a2a::{

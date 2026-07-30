@@ -117,6 +117,22 @@ async fn agent_card_is_a2a_1_0_shape() {
 }
 
 #[tokio::test]
+async fn agent_card_version_tracks_crate_version() {
+    // The card's default version comes from `apcore_a2a::VERSION`, which is
+    // derived from Cargo.toml. A hand-maintained literal silently drifts and
+    // makes the served card advertise a release the binary is not.
+    assert_eq!(apcore_a2a::VERSION, env!("CARGO_PKG_VERSION"));
+
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = build().await.oneshot(req).await.unwrap();
+    let card = body_json(resp).await;
+    assert_eq!(card["version"], json!(env!("CARGO_PKG_VERSION")));
+}
+
+#[tokio::test]
 async fn agent_json_alias_served() {
     let req = Request::builder()
         .uri("/.well-known/agent.json")
