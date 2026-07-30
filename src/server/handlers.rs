@@ -41,6 +41,9 @@ pub struct AppState {
     pub task_store: Arc<dyn TaskStore>,
     /// Known skill (module) ids from the registry, for request-time validation.
     pub skill_ids: Arc<HashSet<String>>,
+    /// Per-skill input schema, so an inbound `TextPart` can be parsed against
+    /// the schema the module actually declares.
+    pub input_schemas: Arc<HashMap<String, Value>>,
     pub agent_card: Arc<Value>,
     /// Agent card enriched with per-skill `_inputSchemas` for the Explorer UI.
     pub explorer_card: Arc<Value>,
@@ -256,10 +259,18 @@ fn parse_request(
         message: "Missing required parameter: metadata.skillId".to_string(),
     })?;
 
+    // The module's own input schema decides how a TextPart is read: against an
+    // object-typed schema its text is parsed as JSON, otherwise it is taken as a
+    // raw string. Passing `None` here made every TextPart a bare string, so the
+    // `application/json` input mode the Agent Card advertises only ever worked
+    // via a DataPart. Python and TS both look the descriptor up and pass it
+    // (apcore-a2a-python server/executor.py:129, apcore-a2a-typescript
+    // src/server/executor.ts:128).
+    let input_schema = state.input_schemas.get(&skill_id);
     let inputs = state
         .executor
         .part_converter()
-        .parts_to_input(&message.parts, None)
+        .parts_to_input(&message.parts, input_schema)
         .map_err(|e| ParseFailure::Task {
             task_id: task_id.clone(),
             context_id: context_id.clone(),

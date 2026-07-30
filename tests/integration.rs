@@ -359,6 +359,71 @@ async fn message_stream_surfaces_caller_fixable_error_detail() {
 }
 
 #[tokio::test]
+async fn text_part_is_parsed_against_the_module_input_schema() {
+    // The card advertises `application/json` as an input mode, but the module's
+    // schema was never passed to the part converter, so a JSON TextPart arrived
+    // as a bare string and only a DataPart ever worked.
+    let (status, resp) = post_rpc(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "messageId": "m1",
+                    "role": "ROLE_USER",
+                    "parts": [{ "text": "{\"hello\": \"world\"}" }]
+                },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let task = &resp["result"];
+    assert_eq!(task["status"]["state"], json!("TASK_STATE_COMPLETED"));
+    // The echo module returns its inputs, so a parsed object comes back as a
+    // data Part — not the raw string.
+    assert_eq!(
+        task["artifacts"][0]["parts"][0]["data"],
+        json!({ "hello": "world" })
+    );
+}
+
+#[tokio::test]
+async fn text_part_that_is_not_json_fails_the_task_with_a_readable_reason() {
+    let resp = {
+        let (_status, resp) = post_rpc(
+            build().await,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "message/send",
+                "params": {
+                    "message": {
+                        "messageId": "m1",
+                        "role": "ROLE_USER",
+                        "parts": [{ "text": "not json at all" }]
+                    },
+                    "metadata": { "skillId": "test.echo" }
+                }
+            }),
+        )
+        .await;
+        resp
+    };
+    let task = &resp["result"];
+    assert_eq!(task["status"]["state"], json!("TASK_STATE_FAILED"));
+    assert!(
+        status_text(task).contains("not valid JSON"),
+        "{}",
+        status_text(task)
+    );
+}
+
+#[tokio::test]
 async fn message_send_missing_skill_id_yields_failed_task() {
     // A-D-303: a missing metadata.skillId now produces a FAILED task (matching
     // Python/TS and the unknown-skill path), not a JSON-RPC -32602 error.

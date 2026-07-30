@@ -105,13 +105,25 @@ impl A2AServerFactory {
             Arc::new(card)
         };
 
-        // Known skill (module) ids for request-time validation.
-        let skill_ids: HashSet<String> = registry.list(None, None, None).into_iter().collect();
+        // Known skill (module) ids for request-time validation, and their input
+        // schemas so an inbound TextPart can be parsed against the right shape.
+        let module_ids = registry.list(None, None, None);
+        let input_schemas: HashMap<String, Value> = module_ids
+            .iter()
+            .filter_map(|module_id| {
+                let def = registry.get_definition(module_id).ok().flatten()?;
+                def.input_schema
+                    .is_object()
+                    .then(|| (module_id.clone(), def.input_schema))
+            })
+            .collect();
+        let skill_ids: HashSet<String> = module_ids.into_iter().collect();
 
         let state = AppState {
             executor,
             task_store,
             skill_ids: Arc::new(skill_ids),
+            input_schemas: Arc::new(input_schemas),
             agent_card: Arc::new(card_value),
             explorer_card,
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
