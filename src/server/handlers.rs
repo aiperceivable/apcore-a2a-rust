@@ -26,6 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use crate::adapters::errors::{sanitize_message, ErrorMapper};
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::storage::TaskStore;
 use crate::types::{
@@ -115,12 +116,35 @@ fn error_to_status(err: &ModuleError) -> TaskStatus {
             TaskState::Failed,
             Message::agent_text("Execution timed out"),
         ),
-        // Unknown/generic errors emit a fixed message rather than leaking the
-        // internal error text (Python/TS parity).
-        _ => TaskStatus::with_message(
-            TaskState::Failed,
-            Message::agent_text("Internal server error"),
-        ),
+        _ => TaskStatus::with_message(TaskState::Failed, Message::agent_text(failure_text(err))),
+    }
+}
+
+/// Caller-facing text for a FAILED task status.
+///
+/// Delegates to [`ErrorMapper`], the crate's single error-redaction policy, so
+/// the task-status surface classifies exactly like the JSON-RPC surface instead
+/// of collapsing every code to one string:
+///
+/// - internal / unrecognized errors keep the fixed `"Internal server error"`
+///   (srs FR-ERR-004 / FR-ERR-008, locked by `error_mapping.json` and by
+///   `streaming_events.json`'s `error_midstream_skips_marker`);
+/// - `ACL_DENIED` stays masked as `"Task not found"` (srs FR-ERR-003);
+/// - caller-fixable classes (schema validation, invalid input, unknown module)
+///   carry their sanitized detail, which srs FR-ERR-002 requires precisely so a
+///   caller "can correct their input without guessing".
+///
+/// For those caller-fixable classes the error's `ai_guidance` is appended when
+/// apcore supplied one: it exists to tell an agent what to do next, and an A2A
+/// caller sees only this status message. It is withheld for every other class,
+/// where the message is a fixed per-class string that must stay fixed.
+fn failure_text(err: &ModuleError) -> String {
+    let message = ErrorMapper::to_jsonrpc_error(err).message;
+    match (err.user_fixable, err.ai_guidance.as_deref()) {
+        (Some(true), Some(guidance)) if !guidance.trim().is_empty() => {
+            format!("{message} ({})", sanitize_message(guidance))
+        }
+        _ => message,
     }
 }
 
@@ -737,18 +761,81 @@ mod tests {
     }
 
     #[test]
-    fn generic_error_yields_fixed_internal_server_error_message() {
-        // Regression (A-D-015): the unknown/generic error arm must emit a fixed
-        // "Internal server error" message, never leaking the raw internal error
-        // text (Python/TS parity).
+    fn internal_error_yields_fixed_internal_server_error_message() {
+        // Regression (A-D-015): an internal or unrecognized error must emit the
+        // fixed "Internal server error" message, never leaking the raw error
+        // text (srs FR-ERR-004 / FR-ERR-008, Python/TS parity).
         let err = ModuleError::new(
-            ErrorCode::GeneralInvalidInput,
+            ErrorCode::GeneralInternalError,
             "super secret internal detail leaking through",
         );
         let status = error_to_status(&err);
         assert_eq!(status.state, TaskState::Failed);
         assert_eq!(
             status_text(&status).as_deref(),
+            Some("Internal server error")
+        );
+    }
+
+    #[test]
+    fn acl_denied_stays_masked_as_task_not_found() {
+        // srs FR-ERR-003: an ACL denial must not disclose the caller, the target
+        // module, or that the denial happened at all.
+        let err = ModuleError::new(
+            ErrorCode::ACLDenied,
+            "caller alice denied module admin.wipe",
+        );
+        let status = error_to_status(&err);
+        assert_eq!(status.state, TaskState::Failed);
+        let text = status_text(&status).unwrap();
+        assert_eq!(text, "Task not found");
+        assert!(!text.contains("alice"));
+        assert!(!text.contains("admin.wipe"));
+    }
+
+    #[test]
+    fn invalid_input_error_reaches_the_caller() {
+        // srs FR-ERR-002/FR-ERR-006: a caller-fixable failure must carry enough
+        // detail for the caller to correct the call. Collapsing it to the generic
+        // string leaves an agent unable to tell a bad argument from a crash.
+        let err = ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            "Parameters '1' and 'l' cannot be used together",
+        );
+        let status = error_to_status(&err);
+        assert_eq!(status.state, TaskState::Failed);
+        let text = status_text(&status).unwrap();
+        assert!(
+            text.contains("'1' and 'l' cannot be used together"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn schema_validation_error_names_the_field() {
+        let err = ModuleError::new(ErrorCode::SchemaValidationError, "width: must be integer");
+        let text = status_text(&error_to_status(&err)).unwrap();
+        assert!(text.contains("width"), "{text}");
+    }
+
+    #[test]
+    fn ai_guidance_is_appended_for_caller_fixable_errors() {
+        // ai_guidance exists to tell an agent what to do next; the A2A caller
+        // sees only this status message, so it is appended there.
+        let err = ModuleError::new(ErrorCode::GeneralInvalidInput, "bad flag combination")
+            .with_ai_guidance("send either -1 or -l, not both");
+        let text = status_text(&error_to_status(&err)).unwrap();
+        assert!(text.contains("send either -1 or -l, not both"), "{text}");
+    }
+
+    #[test]
+    fn ai_guidance_is_withheld_for_internal_errors() {
+        // The fixed per-class strings must stay fixed: guidance on an internal
+        // error would both widen the message and risk leaking internal detail.
+        let err = ModuleError::new(ErrorCode::GeneralInternalError, "boom")
+            .with_ai_guidance("inspect /var/log/secret.log");
+        assert_eq!(
+            status_text(&error_to_status(&err)).as_deref(),
             Some("Internal server error")
         );
     }

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use apcore::context::Context;
-use apcore::errors::ModuleError;
+use apcore::errors::{ErrorCode, ModuleError};
 use apcore::module::Module;
 use apcore::registry::registry::Registry;
 use apcore_a2a::{build_app, APCoreA2AConfig, BackendSource};
@@ -36,12 +36,63 @@ impl Module for EchoModule {
     }
 }
 
-/// A registry with a single `test.echo` module.
+/// Module that refuses its input the way apcore's own input guards do.
+struct GuardModule;
+
+#[async_trait]
+impl Module for GuardModule {
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn output_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn description(&self) -> &str {
+        "Always refuses its input"
+    }
+    async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        Err(ModuleError::new(
+            ErrorCode::GeneralInvalidInput,
+            "Parameters '1' and 'l' cannot be used together",
+        )
+        .with_ai_guidance("send one or the other"))
+    }
+}
+
+/// Module that fails with an internal error carrying sensitive text.
+struct InternalFailModule;
+
+#[async_trait]
+impl Module for InternalFailModule {
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn output_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn description(&self) -> &str {
+        "Always fails internally"
+    }
+    async fn execute(&self, _inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        Err(ModuleError::new(
+            ErrorCode::GeneralInternalError,
+            "Database password: P@ssw0rd123",
+        ))
+    }
+}
+
+/// A registry with the `test.echo`, `test.guard` and `test.internal` modules.
 fn echo_registry() -> Arc<Registry> {
     let registry = Registry::new();
     registry
         .register_module("test.echo", Box::new(EchoModule))
         .expect("register echo module");
+    registry
+        .register_module("test.guard", Box::new(GuardModule))
+        .expect("register guard module");
+    registry
+        .register_module("test.internal", Box::new(InternalFailModule))
+        .expect("register internal-fail module");
     Arc::new(registry)
 }
 
@@ -182,6 +233,88 @@ async fn message_send_executes_and_completes() {
         task["artifacts"][0]["parts"][0]["data"],
         json!({ "hello": "world" })
     );
+}
+
+/// Send a `message/send` for `skill_id` with an empty data Part.
+async fn send_to(router: axum::Router, skill_id: &str) -> Value {
+    let (_status, resp) = post_rpc(
+        router,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "message/send",
+            "params": {
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "data": {} }] },
+                "metadata": { "skillId": skill_id }
+            }
+        }),
+    )
+    .await;
+    resp
+}
+
+/// Extract a task status message's text.
+fn status_text(task: &Value) -> String {
+    task["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn failed_task_surfaces_caller_fixable_error_detail() {
+    // A guard refusal must reach the caller intact: an agent that cannot tell a
+    // bad argument from a crash cannot self-correct, which is the whole point of
+    // the guard (srs FR-ERR-002 "correct their input without guessing").
+    let resp = send_to(build().await, "test.guard").await;
+    let task = &resp["result"];
+    assert_eq!(task["status"]["state"], json!("TASK_STATE_FAILED"));
+    let text = status_text(task);
+    assert!(
+        text.contains("'1' and 'l' cannot be used together"),
+        "guard text missing from {text:?}"
+    );
+    assert!(
+        text.contains("send one or the other"),
+        "ai_guidance missing from {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_task_keeps_internal_errors_opaque() {
+    // The counterpart guarantee: an internal error still collapses to the fixed
+    // string, so no internal detail rides out on the status message.
+    let resp = send_to(build().await, "test.internal").await;
+    let task = &resp["result"];
+    assert_eq!(task["status"]["state"], json!("TASK_STATE_FAILED"));
+    let text = status_text(task);
+    assert_eq!(text, "Internal server error");
+    assert!(!text.contains("P@ssw0rd123"));
+}
+
+#[tokio::test]
+async fn message_stream_surfaces_caller_fixable_error_detail() {
+    // The streaming path shares error_to_status, so it must classify identically.
+    let events = collect_sse(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "message/stream",
+            "params": {
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "data": {} }] },
+                "metadata": { "skillId": "test.guard" }
+            }
+        }),
+    )
+    .await;
+    let terminal = events.last().expect("at least one event");
+    let status = &terminal["statusUpdate"]["status"];
+    assert_eq!(status["state"], json!("TASK_STATE_FAILED"));
+    assert!(status["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("cannot be used together"));
 }
 
 #[tokio::test]

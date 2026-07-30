@@ -82,7 +82,10 @@ impl ErrorMapper {
     }
 }
 
-fn sanitize_message(message: &str) -> String {
+/// Strip paths, tracebacks and excess whitespace from text bound for a caller.
+/// Crate-visible so the task-status surface (`server::handlers`) applies exactly
+/// the same redaction as the JSON-RPC surface.
+pub(crate) fn sanitize_message(message: &str) -> String {
     // Match Unix absolute paths (single or multi-component) and ~ paths.
     let path_re = regex::Regex::new(r"~?/\S*").unwrap();
     let cleaned = path_re.replace_all(message, "");
