@@ -458,6 +458,56 @@ async fn message_stream_surfaces_caller_fixable_error_detail() {
 }
 
 #[tokio::test]
+async fn sdk_conventional_lowercase_role_is_accepted() {
+    // `"role": "user"` is what an SDK-conventional client sends. It used to be
+    // rejected with -32602 "Missing or invalid parameter: message", naming the
+    // wrong field entirely — the actual requirement was the protobuf enum name.
+    let (_status, resp) = post_rpc(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "message/send",
+            "params": {
+                "message": { "messageId": "m1", "role": "user", "parts": [{ "data": { "a": 1 } }] },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "unexpected error: {resp:?}");
+    assert_eq!(
+        resp["result"]["status"]["state"],
+        json!("TASK_STATE_COMPLETED")
+    );
+}
+
+#[tokio::test]
+async fn unreadable_message_names_the_field_that_failed() {
+    // An unusable role must not be reported as a missing `message`.
+    let (_status, resp) = post_rpc(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "message/send",
+            "params": {
+                "message": { "messageId": "m1", "role": "wizard", "parts": [{ "data": {} }] },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32602));
+    let message = resp["error"]["message"].as_str().unwrap();
+    // The rejected value and the accepted ones, rather than a claim that the
+    // whole `message` parameter was missing.
+    assert!(message.contains("wizard"), "{message}");
+    assert!(message.contains("ROLE_USER"), "{message}");
+    assert!(!message.contains("Missing"), "{message}");
+}
+
+#[tokio::test]
 async fn text_part_is_parsed_against_the_module_input_schema() {
     // The card advertises `application/json` as an input mode, but the module's
     // schema was never passed to the part converter, so a JSON TextPart arrived

@@ -15,13 +15,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A2A 1.0 message sender role.
+///
+/// Serializes as the protobuf enum name (`ROLE_USER`), which is the A2A 1.0
+/// wire value. The lowercase A2A 0.3 spellings are accepted on the way in:
+/// they are what an SDK-conventional client sends, and apcore-a2a-python
+/// accepts them too (its factory enables the a2a-sdk v0.3 compat layer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
-    #[serde(rename = "ROLE_UNSPECIFIED")]
+    #[serde(rename = "ROLE_UNSPECIFIED", alias = "unspecified")]
     Unspecified,
-    #[serde(rename = "ROLE_USER")]
+    #[serde(rename = "ROLE_USER", alias = "user")]
     User,
-    #[serde(rename = "ROLE_AGENT")]
+    #[serde(rename = "ROLE_AGENT", alias = "agent")]
     Agent,
 }
 

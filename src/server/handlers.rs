@@ -376,14 +376,22 @@ fn parse_request(
 ) -> Result<(String, String, String, Value), ParseFailure> {
     // The message envelope is required at the protocol level: without it there is
     // no task context to fail (Python/TS reach the executor only with a message).
-    let message: Message = params
-        .get("message")
-        .cloned()
-        .and_then(|m| serde_json::from_value(m).ok())
-        .ok_or(ParseFailure::Rpc(
+    // A present-but-unreadable message reports what actually failed to parse: a
+    // single "Missing or invalid parameter: message" named the wrong field for
+    // every malformed part, role or id inside it.
+    let raw_message = params.get("message").cloned().ok_or(ParseFailure::Rpc(
+        CODE_INVALID_PARAMS,
+        "Missing required parameter: message".to_string(),
+    ))?;
+    let message: Message = serde_json::from_value(raw_message).map_err(|e| {
+        ParseFailure::Rpc(
             CODE_INVALID_PARAMS,
-            "Missing or invalid parameter: message".to_string(),
-        ))?;
+            format!(
+                "Invalid parameter: message ({})",
+                sanitize_message(&e.to_string())
+            ),
+        )
+    })?;
 
     let task_id = Uuid::new_v4().to_string();
     let context_id = message
