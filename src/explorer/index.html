@@ -881,10 +881,12 @@ function appendSSEEvent(type, dataStr) {
   const div = document.createElement("div");
   div.className = "sse-event";
 
-  // Extract state for badge
-  const state = parsed?.result?.status?.state || parsed?.status?.state;
+  // Extract state for badge. A stream frame is a JSON-RPC response whose result
+  // is the A2A oneof event, so look inside result.statusUpdate as well.
+  const event = parsed?.result ?? parsed;
+  const state = event?.statusUpdate?.status?.state || event?.status?.state;
   const stateBadge = state ? taskStateBadge(state) : "";
-  const taskId = parsed?.result?.id || parsed?.id;
+  const taskId = event?.statusUpdate?.taskId || event?.id;
 
   if (taskId && !document.getElementById("task-id-input").value) {
     document.getElementById("task-id-input").value = taskId;

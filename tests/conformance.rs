@@ -206,6 +206,9 @@ async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
         .lines()
         .filter_map(|l| l.strip_prefix("data:"))
         .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+        // Each frame is a JSON-RPC response carrying the A2A event as `result`
+        // (matching a2a-python / a2a-js); the fixtures describe the event.
+        .map(|frame| frame["result"].clone())
         .collect()
 }
 

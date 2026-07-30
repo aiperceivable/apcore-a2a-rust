@@ -154,7 +154,8 @@ impl A2AClient {
                     }
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim_start();
-                        if let Ok(event) = serde_json::from_str::<Value>(data) {
+                        if let Ok(frame) = serde_json::from_str::<Value>(data) {
+                            let event = unwrap_stream_envelope(frame);
                             let terminal = is_terminal_event(&event);
                             yield event;
                             if terminal {
@@ -254,6 +255,18 @@ fn build_message_params(
         params["contextId"] = Value::String(cid);
     }
     params
+}
+
+/// Unwrap the JSON-RPC response envelope an SSE frame carries, yielding the
+/// bare A2A stream event.
+///
+/// Frames without an envelope are passed through unchanged, so the client still
+/// reads a server that emits bare payloads.
+fn unwrap_stream_envelope(frame: Value) -> Value {
+    match (frame.get("jsonrpc"), frame.get("result")) {
+        (Some(_), Some(result)) => result.clone(),
+        _ => frame,
+    }
 }
 
 /// True if an SSE event carries a terminal task status.

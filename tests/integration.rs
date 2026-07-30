@@ -147,8 +147,8 @@ async fn post_rpc(router: axum::Router, body: Value) -> (StatusCode, Value) {
     (status, body_json(resp).await)
 }
 
-/// POST a `message/stream` request and collect the SSE `data:` frames as JSON.
-async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
+/// POST a `message/stream` request and collect the raw SSE `data:` frames.
+async fn collect_sse_frames(router: axum::Router, body: Value) -> Vec<Value> {
     let req = Request::builder()
         .method("POST")
         .uri("/")
@@ -161,6 +161,15 @@ async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
     text.lines()
         .filter_map(|l| l.strip_prefix("data:"))
         .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
+        .collect()
+}
+
+/// Collect a stream's A2A events, unwrapping each frame's JSON-RPC envelope.
+async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
+    collect_sse_frames(router, body)
+        .await
+        .into_iter()
+        .map(|frame| frame["result"].clone())
         .collect()
 }
 
@@ -389,6 +398,38 @@ async fn failed_task_keeps_internal_errors_opaque() {
     let text = status_text(task);
     assert_eq!(text, "Internal server error");
     assert!(!text.contains("P@ssw0rd123"));
+}
+
+#[tokio::test]
+async fn sse_frames_are_jsonrpc_responses_carrying_the_event() {
+    // Each `data:` used to be a bare `{"statusUpdate":{...}}`, which an
+    // off-the-shelf a2a-python / a2a-js client cannot parse.
+    let frames = collect_sse_frames(
+        build().await,
+        json!({
+            "jsonrpc": "2.0",
+            "id": "req-7",
+            "method": "message/stream",
+            "params": {
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "data": { "x": 1 } }] },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await;
+
+    assert!(!frames.is_empty());
+    for frame in &frames {
+        assert_eq!(frame["jsonrpc"], json!("2.0"));
+        assert_eq!(frame["id"], json!("req-7"), "the request id is echoed");
+        assert!(frame["result"].is_object(), "event lives under result");
+    }
+    // A2A 1.0 discriminates by the oneof wrapper key; `kind` and `final` were
+    // removed and must not come back.
+    let first = &frames[0]["result"];
+    assert!(first.get("statusUpdate").is_some());
+    assert!(first.get("kind").is_none());
+    assert!(first["statusUpdate"].get("final").is_none());
 }
 
 #[tokio::test]

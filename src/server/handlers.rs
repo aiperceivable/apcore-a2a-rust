@@ -146,6 +146,26 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// Render one stream event as an SSE frame.
+///
+/// The `data:` payload is a full JSON-RPC response carrying the event as its
+/// `result`, which is what both upstream A2A servers put on the wire
+/// (a2a-python `jsonrpc_dispatcher.py` `_wrap_stream` ->
+/// `JSONRPC20Response(result=..., _id=request_id).data`; a2a-js
+/// `jsonrpc_transport_handler.ts` `yield { jsonrpc: '2.0', id: requestId,
+/// result: StreamResponse.toJSON(event) }`). A bare payload cannot be parsed by
+/// an off-the-shelf `a2a-python` / `a2a-js` client.
+///
+/// No `kind` discriminator, no `final` flag and no SSE `id:` line: A2A 1.0
+/// discriminates by the `oneof` wrapper key, dropped `final` in favour of the
+/// terminal `TaskState`, and neither upstream server emits SSE `id:`.
+fn sse_event(id: &Value, event: &StreamEvent) -> Event {
+    let payload = serde_json::to_value(event).unwrap_or(Value::Null);
+    Event::default()
+        .json_data(rpc_result(id, payload))
+        .unwrap_or_default()
+}
+
 const CODE_PARSE_ERROR: i32 = -32700;
 const CODE_INVALID_REQUEST: i32 = -32600;
 const CODE_METHOD_NOT_FOUND: i32 = -32601;
@@ -441,6 +461,7 @@ async fn failed_task_stream(
     task_id: String,
     context_id: String,
     owner: &str,
+    id: Value,
     message: String,
 ) -> Response {
     register_owner(state, &task_id, owner);
@@ -470,8 +491,8 @@ async fn failed_task_stream(
         }),
         terminal,
     ];
-    let event_stream = tokio_stream::iter(events)
-        .map(|ev| Ok::<Event, Infallible>(Event::default().json_data(&ev).unwrap_or_default()));
+    let event_stream =
+        tokio_stream::iter(events).map(move |ev| Ok::<Event, Infallible>(sse_event(&id, &ev)));
     Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -584,7 +605,7 @@ async fn handle_stream(
             task_id,
             context_id,
             message,
-        }) => return failed_task_stream(state, task_id, context_id, owner, message).await,
+        }) => return failed_task_stream(state, task_id, context_id, owner, id, message).await,
     };
 
     register_owner(state, &task_id, owner);
@@ -724,8 +745,8 @@ async fn handle_stream(
         // `_cancel_guard` unregisters the cancel token on drop (all exit paths).
     });
 
-    let event_stream = ReceiverStream::new(rx)
-        .map(|ev| Ok::<Event, Infallible>(Event::default().json_data(&ev).unwrap_or_default()));
+    let event_stream =
+        ReceiverStream::new(rx).map(move |ev| Ok::<Event, Infallible>(sse_event(&id, &ev)));
 
     Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
