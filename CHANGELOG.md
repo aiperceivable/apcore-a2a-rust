@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Conformance and correctness fixes on the A2A server path, from
+`aiperceivable/apexe` issues #33, #34 and #35.
+
+### Fixed
+
+- **Failed tasks no longer collapse every error to `"Internal server error"`.**
+  `error_to_status` now routes through `ErrorMapper`, the crate's single
+  redaction policy, so the task-status surface classifies like the JSON-RPC
+  surface. Internal and unrecognized errors keep the fixed string (srs
+  FR-ERR-004 / FR-ERR-008) and ACL denials stay masked (FR-ERR-003), but
+  caller-fixable failures — schema validation, invalid input, unknown module —
+  carry their sanitized detail plus `ai_guidance` when apcore supplied one. An
+  agent that reads a guard refusal can now correct itself. Python and TS emit
+  the fixed string on this path too, so they need the same change.
+- **`tasks/cancel` is guarded.** Unknown ids return `-32001` instead of
+  fabricating a CANCELED task, terminal tasks return `-32002` instead of having
+  their artifacts destroyed, and a cancelled task keeps the artifacts and
+  history it had already accumulated (srs FR-TSK-005; matches a2a-python's
+  `on_cancel_task`).
+- **`TextPart` input works.** The module's input schema is now passed to the
+  part converter, so a JSON text part is parsed against it rather than arriving
+  as a bare string — making the `application/json` input mode on the Agent Card
+  usable without a `DataPart`.
+- **JSON-RPC 2.0 envelope validation.** Malformed JSON returns `-32700` in a
+  JSON-RPC response instead of a `text/plain` HTTP 400; a `"jsonrpc"` other
+  than `"2.0"`, a missing `jsonrpc`/`method`, and a batch array all return
+  `-32600` (previously accepted, or reported as `-32601`).
+- **SSE frames are JSON-RPC responses.** Each `data:` now carries
+  `{"jsonrpc","id","result":<event>}`, matching a2a-python and a2a-js, so an
+  off-the-shelf A2A client can parse the stream. Event ordering, the terminal
+  `lastChunk` marker and the `oneof` wrapper keys are unchanged; `kind`,
+  `final` and SSE `id:` lines remain absent, as A2A 1.0 requires.
+- **`"role": "user"` is accepted.** The lowercase A2A 0.3 spellings are
+  deserialization aliases (`ROLE_*` is still what is serialized), and an
+  unreadable `message` now reports what actually failed to parse instead of
+  claiming the parameter was missing.
+- **`VERSION` tracks the crate version** (`CARGO_PKG_VERSION`) rather than a
+  hand-maintained literal that had drifted to `0.4.1`.
+
+### Security
+
+- **`tasks/list` / `tasks/get` / `tasks/cancel` are scoped to the authenticated
+  principal.** `tasks/list` previously returned every caller's tasks including
+  their output, and a task could be read or cancelled by id from any caller.
+  Cross-principal access is masked as `-32001` so task ids cannot be probed.
+  With no authenticator configured all callers share one owner, as upstream's
+  `UnauthenticatedUser` does, so single-tenant deployments are unaffected.
+- **The Agent Card advertises only ACL-allowed skills.** The ACL gated the call
+  but not the advertisement, so a deny-all-but-one ACL still disclosed the whole
+  module inventory. Filtering is per caller; the auth middleware now identifies
+  callers on exempt paths (without rejecting them) so an authenticated client
+  is not evaluated as `@external`.
+
 ## [0.4.4] - 2026-07-14
 
 Patch release. Bumps the required `apcore` floor to `0.26` to align the ecosystem on the 0.26.0 governance layer (additive, no breaking changes). No code or API changes.
