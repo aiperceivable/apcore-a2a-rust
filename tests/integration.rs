@@ -81,7 +81,28 @@ impl Module for InternalFailModule {
     }
 }
 
-/// A registry with the `test.echo`, `test.guard` and `test.internal` modules.
+/// Module that stays in flight long enough for a concurrent `tasks/cancel`.
+struct SlowModule;
+
+#[async_trait]
+impl Module for SlowModule {
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn output_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn description(&self) -> &str {
+        "Sleeps before returning"
+    }
+    async fn execute(&self, inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        Ok(inputs)
+    }
+}
+
+/// A registry with the `test.echo`, `test.guard`, `test.internal` and
+/// `test.slow` modules.
 fn echo_registry() -> Arc<Registry> {
     let registry = Registry::new();
     registry
@@ -93,6 +114,9 @@ fn echo_registry() -> Arc<Registry> {
     registry
         .register_module("test.internal", Box::new(InternalFailModule))
         .expect("register internal-fail module");
+    registry
+        .register_module("test.slow", Box::new(SlowModule))
+        .expect("register slow module");
     Arc::new(registry)
 }
 
@@ -251,6 +275,23 @@ async fn send_to(router: axum::Router, skill_id: &str) -> Value {
     )
     .await;
     resp
+}
+
+/// Poll `tasks/list` until the task a concurrent `message/send` persisted as
+/// SUBMITTED appears, and return its (server-generated) id.
+async fn await_in_flight_task_id(router: axum::Router) -> String {
+    for _ in 0..100 {
+        let (_status, listed) = post_rpc(
+            router.clone(),
+            json!({ "jsonrpc": "2.0", "id": "list", "method": "tasks/list", "params": {} }),
+        )
+        .await;
+        if let Some(id) = listed["result"]["tasks"][0]["id"].as_str() {
+            return id.to_string();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("in-flight task was never persisted");
 }
 
 /// Extract a task status message's text.
@@ -538,6 +579,96 @@ async fn tasks_get_unknown_is_task_not_found() {
     assert_eq!(resp["error"]["code"], json!(-32001));
 }
 
+#[tokio::test]
+async fn tasks_cancel_unknown_is_task_not_found_and_creates_nothing() {
+    // `tasks/cancel` used to write unconditionally, so an unknown id became a
+    // persisted CANCELED task — and `tasks/get` reported the same id as missing.
+    // The two methods must agree on whether a task exists.
+    let router = build().await;
+    let (_status, resp) = post_rpc(
+        router.clone(),
+        json!({ "jsonrpc": "2.0", "id": "1", "method": "tasks/cancel", "params": { "id": "nope" } }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32001));
+
+    let (_status, after) = post_rpc(
+        router,
+        json!({ "jsonrpc": "2.0", "id": "2", "method": "tasks/get", "params": { "id": "nope" } }),
+    )
+    .await;
+    assert_eq!(after["error"]["code"], json!(-32001));
+}
+
+#[tokio::test]
+async fn tasks_cancel_on_completed_task_preserves_its_artifacts() {
+    // Cancelling a COMPLETED task used to overwrite it with an empty CANCELED
+    // task, destroying the tool output the caller was about to fetch.
+    let router = build().await;
+    let completed = send_to(router.clone(), "test.echo").await;
+    let task_id = completed["result"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        completed["result"]["status"]["state"],
+        json!("TASK_STATE_COMPLETED")
+    );
+
+    let (_status, cancel) = post_rpc(
+        router.clone(),
+        json!({ "jsonrpc": "2.0", "id": "2", "method": "tasks/cancel", "params": { "id": task_id } }),
+    )
+    .await;
+    // srs FR-TSK-005: terminal states are not cancelable.
+    assert_eq!(cancel["error"]["code"], json!(-32002));
+    assert!(cancel["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("TASK_STATE_COMPLETED"));
+
+    let (_status, fetched) = post_rpc(
+        router,
+        json!({ "jsonrpc": "2.0", "id": "3", "method": "tasks/get", "params": { "id": task_id } }),
+    )
+    .await;
+    let task = &fetched["result"];
+    assert_eq!(task["status"]["state"], json!("TASK_STATE_COMPLETED"));
+    assert_eq!(
+        task["artifacts"].as_array().map(Vec::len),
+        Some(1),
+        "the completed task's artifact must survive a late cancel"
+    );
+}
+
+#[tokio::test]
+async fn tasks_cancel_succeeds_while_the_task_is_in_flight() {
+    // The guarded handler must still cancel from a non-terminal state.
+    let router = build().await;
+    let sending = tokio::spawn({
+        let router = router.clone();
+        async move { send_to(router, "test.slow").await }
+    });
+
+    let task_id = await_in_flight_task_id(router.clone()).await;
+
+    let (_status, cancel) = post_rpc(
+        router,
+        json!({ "jsonrpc": "2.0", "id": "2", "method": "tasks/cancel", "params": { "id": task_id } }),
+    )
+    .await;
+    assert!(
+        cancel.get("error").is_none(),
+        "unexpected error: {cancel:?}"
+    );
+    assert_eq!(
+        cancel["result"]["status"]["state"],
+        json!("TASK_STATE_CANCELED")
+    );
+    assert_eq!(
+        cancel["result"]["status"]["message"]["parts"][0]["text"],
+        json!("Canceled by client")
+    );
+    let _ = sending.await;
+}
+
 async fn build_explorer() -> axum::Router {
     let cfg = APCoreA2AConfig {
         explorer: true,
@@ -635,12 +766,17 @@ async fn push_notification_delivered_to_webhook() {
     });
     let webhook_url = format!("http://{addr}/hook");
 
-    // Register a webhook for a known task id, then trigger a terminal status via
-    // tasks/cancel — which delivers the CANCELED statusUpdate to the webhook.
-    // (message/send generates a random task id, so a pre-registered id can't be
-    // targeted; tasks/cancel accepts an explicit id, giving a deterministic test.)
+    // Start a real long-running task, register a webhook for it, then cancel it:
+    // tasks/cancel emits the terminal CANCELED status, which is delivered to the
+    // webhook. (tasks/cancel no longer accepts an arbitrary id, so the task has
+    // to exist first.)
     let app = build().await;
-    let task_id = "push-task-1";
+    let sending = tokio::spawn({
+        let app = app.clone();
+        async move { send_to(app, "test.slow").await }
+    });
+    let task_id = await_in_flight_task_id(app.clone()).await;
+
     let (_s, _set) = post_rpc(
         app.clone(),
         json!({"jsonrpc":"2.0","id":"1","method":"tasks/pushNotificationConfig/set",
@@ -648,8 +784,6 @@ async fn push_notification_delivered_to_webhook() {
     )
     .await;
 
-    // tasks/cancel emits a terminal CANCELED status for the task id, which is
-    // delivered to the registered webhook.
     let (_s, _cancel) = post_rpc(
         app,
         json!({"jsonrpc":"2.0","id":"2","method":"tasks/cancel","params":{"id":task_id}}),
@@ -665,4 +799,5 @@ async fn push_notification_delivered_to_webhook() {
         json!("TASK_STATE_CANCELED")
     );
     assert_eq!(received["statusUpdate"]["taskId"], json!(task_id));
+    let _ = sending.await;
 }

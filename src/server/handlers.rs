@@ -86,6 +86,7 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
 const CODE_METHOD_NOT_FOUND: i32 = -32601;
 const CODE_INVALID_PARAMS: i32 = -32602;
 const CODE_TASK_NOT_FOUND: i32 = -32001;
+const CODE_TASK_NOT_CANCELABLE: i32 = -32002;
 
 /// Extract `metadata.skillId` from the JSON-RPC params.
 fn skill_id_of(params: &Value) -> Option<String> {
@@ -586,39 +587,54 @@ async fn handle_get(state: &AppState, params: &Value) -> Result<Value, (i32, Str
 }
 
 /// `tasks/cancel` — signal cooperative cancellation and mark the task canceled.
+///
+/// Guarded per srs FR-TSK-005 and the upstream A2A reference handler
+/// (`a2a-python` `DefaultRequestHandler.on_cancel_task`): look the task up
+/// first, `-32001` when it does not exist, `-32002` when it is already
+/// terminal, and cancel only from a non-terminal state. Writing
+/// unconditionally both fabricated tasks for unknown ids — contradicting
+/// `tasks/get`, which reports the same id as missing — and replaced a
+/// COMPLETED task's artifacts, destroying the result it had already produced.
 async fn handle_cancel(state: &AppState, params: &Value) -> Result<Value, (i32, String)> {
     let task_id = params.get("id").and_then(Value::as_str).ok_or((
         CODE_INVALID_PARAMS,
         "Missing required parameter: id".to_string(),
     ))?;
 
-    if let Some(token) = state.cancel_tokens.lock().unwrap().remove(task_id) {
-        token.cancel();
-    }
-
-    let context_id = state
+    let stored = state
         .task_store
         .get(task_id)
         .await
         .ok()
         .flatten()
-        .and_then(|t| {
-            t.get("contextId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| task_id.to_string());
+        .ok_or((CODE_TASK_NOT_FOUND, "Task not found".to_string()))?;
 
-    let task = Task {
-        id: task_id.to_string(),
-        context_id: context_id.clone(),
-        status: TaskStatus::with_message(
-            TaskState::Canceled,
-            Message::agent_text("Canceled by client"),
-        ),
-        artifacts: vec![],
-        history: vec![],
-    };
+    // A task whose stored JSON cannot be read back is unusable, not cancelable.
+    let mut task: Task = serde_json::from_value(stored)
+        .map_err(|_| (CODE_TASK_NOT_FOUND, "Task not found".to_string()))?;
+
+    if task.status.state.is_terminal() {
+        let state_name = serde_json::to_value(task.status.state)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        return Err((
+            CODE_TASK_NOT_CANCELABLE,
+            format!("Task is not cancelable: current state is {state_name}"),
+        ));
+    }
+
+    if let Some(token) = state.cancel_tokens.lock().unwrap().remove(task_id) {
+        token.cancel();
+    }
+
+    // Update in place: artifacts and history a non-terminal task already
+    // accumulated belong to it and survive the cancellation.
+    task.status = TaskStatus::with_message(
+        TaskState::Canceled,
+        Message::agent_text("Canceled by client"),
+    );
+    let context_id = task.context_id.clone();
     let task_json = serde_json::to_value(&task).unwrap();
     let _ = state.task_store.save(task_id, task_json.clone()).await;
 

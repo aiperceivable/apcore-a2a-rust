@@ -116,12 +116,41 @@ async fn get_task_unknown_is_task_not_found() {
 }
 
 #[tokio::test]
-async fn cancel_task_returns_canceled() {
+async fn cancel_task_unknown_is_task_not_found() {
     let url = spawn_server().await;
     let client = A2AClient::new(url);
 
-    let task = client.cancel_task("task-x").await.expect("cancel_task");
-    assert_eq!(task["status"]["state"], json!("TASK_STATE_CANCELED"));
+    // `tasks/cancel` on an id that was never issued must agree with `tasks/get`
+    // (-32001), not fabricate a CANCELED task for it.
+    let err = client.cancel_task("task-x").await.unwrap_err();
+    assert!(
+        matches!(err, A2AClientError::TaskNotFound { .. }),
+        "expected TaskNotFound, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_task_on_completed_is_task_not_cancelable() {
+    let url = spawn_server().await;
+    let client = A2AClient::new(url);
+
+    let task = client
+        .send_message(
+            user_message(json!({ "a": 1 })),
+            Some(json!({ "skillId": "test.echo" })),
+            None,
+        )
+        .await
+        .expect("send_message");
+    let task_id = task["id"].as_str().expect("task id");
+
+    // srs FR-TSK-005: a terminal task is not cancelable. The client already had
+    // the typed variant for -32002; only the server never emitted it.
+    let err = client.cancel_task(task_id).await.unwrap_err();
+    assert!(
+        matches!(err, A2AClientError::TaskNotCancelable { .. }),
+        "expected TaskNotCancelable, got {err:?}"
+    );
 }
 
 #[tokio::test]
