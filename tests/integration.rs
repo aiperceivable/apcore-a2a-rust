@@ -474,7 +474,8 @@ async fn unknown_method_is_method_not_found() {
     assert_eq!(resp["error"]["code"], json!(-32601));
 }
 
-/// Test authenticator: accepts `Authorization: Bearer good`, rejects otherwise.
+/// Test authenticator: accepts `Authorization: Bearer good` as principal `u1`
+/// and `Bearer other` as principal `u2`; rejects anything else.
 struct TestAuth;
 
 #[async_trait]
@@ -483,16 +484,17 @@ impl apcore_a2a::Authenticator for TestAuth {
         &self,
         headers: &std::collections::HashMap<String, String>,
     ) -> Option<apcore::context::Identity> {
-        if headers.get("authorization").map(String::as_str) == Some("Bearer good") {
-            Some(apcore::context::Identity::new(
-                "u1".into(),
-                "test".into(),
-                vec![],
-                std::collections::HashMap::new(),
-            ))
-        } else {
-            None
-        }
+        let principal = match headers.get("authorization").map(String::as_str) {
+            Some("Bearer good") => "u1",
+            Some("Bearer other") => "u2",
+            _ => return None,
+        };
+        Some(apcore::context::Identity::new(
+            principal.into(),
+            "test".into(),
+            vec![],
+            std::collections::HashMap::new(),
+        ))
     }
     fn security_schemes(&self) -> Option<Value> {
         Some(json!({ "bearer": { "type": "http", "scheme": "bearer" } }))
@@ -550,6 +552,80 @@ async fn auth_allows_valid_bearer_and_card_stays_public() {
     let card = body_json(card_resp).await;
     assert_eq!(card["capabilities"]["extendedAgentCard"], json!(true));
     assert!(card["securitySchemes"]["bearer"].is_object());
+}
+
+/// POST a JSON-RPC request as the principal behind `bearer`.
+async fn post_rpc_as(router: axum::Router, bearer: &str, body: Value) -> Value {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn task_reads_are_scoped_to_the_authenticated_principal() {
+    // `tasks/list` returned every caller's tasks, including the full stdout of
+    // tasks other callers submitted, and `tasks/get` / `tasks/cancel` accepted
+    // another principal's task id.
+    let app = build_with_auth().await;
+
+    let sent = post_rpc_as(
+        app.clone(),
+        "good",
+        json!({
+            "jsonrpc": "2.0", "id": "1", "method": "message/send",
+            "params": {
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "data": { "secret": "u1-only" } }] },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await;
+    let task_id = sent["result"]["id"].as_str().expect("task id").to_string();
+
+    // The owner sees it.
+    let mine = post_rpc_as(
+        app.clone(),
+        "good",
+        json!({ "jsonrpc": "2.0", "id": "2", "method": "tasks/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(mine["result"]["tasks"].as_array().map(Vec::len), Some(1));
+
+    // Another principal sees nothing, and cannot reach the task by id.
+    let theirs = post_rpc_as(
+        app.clone(),
+        "other",
+        json!({ "jsonrpc": "2.0", "id": "3", "method": "tasks/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(
+        theirs["result"]["tasks"].as_array().map(Vec::len),
+        Some(0),
+        "u2 must not see u1's tasks: {theirs:?}"
+    );
+
+    let stolen_get = post_rpc_as(
+        app.clone(),
+        "other",
+        json!({ "jsonrpc": "2.0", "id": "4", "method": "tasks/get", "params": { "id": task_id } }),
+    )
+    .await;
+    // Masked as not-found so the id's existence is not disclosed.
+    assert_eq!(stolen_get["error"]["code"], json!(-32001));
+
+    let stolen_cancel = post_rpc_as(
+        app,
+        "other",
+        json!({ "jsonrpc": "2.0", "id": "5", "method": "tasks/cancel", "params": { "id": task_id } }),
+    )
+    .await;
+    assert_eq!(stolen_cancel["error"]["code"], json!(-32001));
 }
 
 #[tokio::test]

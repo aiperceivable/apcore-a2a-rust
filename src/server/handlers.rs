@@ -47,7 +47,24 @@ pub struct AppState {
     pub cancel_tokens: Arc<Mutex<HashMap<String, CancelToken>>>,
     /// Per-task push-notification webhook configs (`tasks/pushNotificationConfig/*`).
     pub push_configs: Arc<Mutex<HashMap<String, Value>>>,
+    /// Owner (authenticated principal) of each task, keyed by task id. Scopes
+    /// `tasks/list` / `tasks/get` / `tasks/cancel` so one caller cannot read or
+    /// cancel another's tasks.
+    pub task_owners: Arc<Mutex<HashMap<String, String>>>,
     pub http: reqwest::Client,
+}
+
+/// Owner key for a request's authenticated principal.
+///
+/// Mirrors the upstream A2A stores, which scope task storage by an owner
+/// resolved from the call context (`a2a-python`'s `OwnerResolver`, whose
+/// default is `context.user.user_name`; `a2a-js`'s per-context bucket). When no
+/// authenticator is configured every request resolves to the same empty owner,
+/// exactly as upstream's `UnauthenticatedUser.user_name` does — a single-tenant
+/// deployment keeps its current behaviour, and configuring auth is what turns
+/// scoping on.
+fn owner_key(identity: Option<&Identity>) -> String {
+    identity.map(|i| i.id().to_string()).unwrap_or_default()
 }
 
 /// Embedded Explorer UI (served at the explorer prefix).
@@ -158,23 +175,24 @@ pub async fn jsonrpc_handler(
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
+    let owner = owner_key(identity.as_ref());
 
     match method {
-        "message/send" => match handle_send(&state, identity, &params).await {
+        "message/send" => match handle_send(&state, identity, &owner, &params).await {
             Ok(task) => Json(rpc_result(&id, task)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "message/stream" => handle_stream(&state, identity, &params, id).await,
-        "tasks/get" => match handle_get(&state, &params).await {
+        "message/stream" => handle_stream(&state, identity, &owner, &params, id).await,
+        "tasks/get" => match handle_get(&state, &owner, &params).await {
             Ok(task) => Json(rpc_result(&id, task)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "tasks/cancel" => match handle_cancel(&state, &params).await {
+        "tasks/cancel" => match handle_cancel(&state, &owner, &params).await {
             Ok(task) => Json(rpc_result(&id, task)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
         "tasks/list" => {
-            let tasks = state.task_store.list().await.unwrap_or_default();
+            let tasks = handle_list(&state, &owner).await;
             Json(rpc_result(&id, json!({ "tasks": tasks }))).into_response()
         }
         "tasks/pushNotificationConfig/set" => match handle_push_set(&state, &params) {
@@ -258,8 +276,10 @@ async fn fail_task(
     state: &AppState,
     task_id: &str,
     context_id: &str,
+    owner: &str,
     message: impl Into<String>,
 ) -> Value {
+    register_owner(state, task_id, owner);
     let status = TaskStatus::with_message(TaskState::Failed, Message::agent_text(message));
     let task = Task {
         id: task_id.to_string(),
@@ -289,8 +309,10 @@ async fn failed_task_stream(
     state: &AppState,
     task_id: String,
     context_id: String,
+    owner: &str,
     message: String,
 ) -> Response {
+    register_owner(state, &task_id, owner);
     let status = TaskStatus::with_message(TaskState::Failed, Message::agent_text(message));
     let task = Task {
         id: task_id.clone(),
@@ -338,6 +360,7 @@ fn submitted_task(task_id: &str, context_id: &str) -> Task {
 async fn handle_send(
     state: &AppState,
     identity: Option<Identity>,
+    owner: &str,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let (skill_id, task_id, context_id, inputs) = match parse_request(state, params) {
@@ -347,7 +370,7 @@ async fn handle_send(
             task_id,
             context_id,
             message,
-        }) => return Ok(fail_task(state, &task_id, &context_id, message).await),
+        }) => return Ok(fail_task(state, &task_id, &context_id, owner, message).await),
     };
 
     // Reject unknown skills with a FAILED task (Python/TS parity).
@@ -356,11 +379,13 @@ async fn handle_send(
             state,
             &task_id,
             &context_id,
+            owner,
             format!("Skill not found: {skill_id}"),
         )
         .await);
     }
 
+    register_owner(state, &task_id, owner);
     let mut task = submitted_task(&task_id, &context_id);
 
     let cancel = CancelToken::new();
@@ -415,6 +440,7 @@ async fn handle_send(
 async fn handle_stream(
     state: &AppState,
     identity: Option<Identity>,
+    owner: &str,
     params: &Value,
     id: Value,
 ) -> Response {
@@ -427,9 +453,10 @@ async fn handle_stream(
             task_id,
             context_id,
             message,
-        }) => return failed_task_stream(state, task_id, context_id, message).await,
+        }) => return failed_task_stream(state, task_id, context_id, owner, message).await,
     };
 
+    register_owner(state, &task_id, owner);
     let cancel = CancelToken::new();
     register_cancel(state, &task_id, cancel.clone());
 
@@ -574,16 +601,52 @@ async fn handle_stream(
         .into_response()
 }
 
-/// `tasks/get` — return a stored task by id.
-async fn handle_get(state: &AppState, params: &Value) -> Result<Value, (i32, String)> {
+/// `tasks/get` — return a stored task by id, if the caller owns it.
+async fn handle_get(state: &AppState, owner: &str, params: &Value) -> Result<Value, (i32, String)> {
     let task_id = params.get("id").and_then(Value::as_str).ok_or((
         CODE_INVALID_PARAMS,
         "Missing required parameter: id".to_string(),
     ))?;
+    if !is_owned_by(state, task_id, owner) {
+        // Masked as "not found" rather than "forbidden", matching how ACL
+        // denials are reported (srs FR-ERR-003): a caller must not learn that
+        // another principal's task id exists.
+        return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
+    }
     match state.task_store.get(task_id).await {
         Ok(Some(task)) => Ok(task),
         _ => Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
     }
+}
+
+/// `tasks/list` — return the calling principal's tasks.
+///
+/// Unscoped, this returned every caller's tasks including the full stdout of
+/// tasks other callers submitted. The upstream A2A stores scope by owner
+/// (`a2a-python`'s `OwnerResolver`, `a2a-js`'s per-context bucket); the spec
+/// repo is silent on it, so this follows upstream.
+async fn handle_list(state: &AppState, owner: &str) -> Vec<Value> {
+    let owned: HashSet<String> = state
+        .task_owners
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, task_owner)| task_owner.as_str() == owner)
+        .map(|(task_id, _)| task_id.clone())
+        .collect();
+
+    state
+        .task_store
+        .list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|task| {
+            task.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| owned.contains(id))
+        })
+        .collect()
 }
 
 /// `tasks/cancel` — signal cooperative cancellation and mark the task canceled.
@@ -595,11 +658,20 @@ async fn handle_get(state: &AppState, params: &Value) -> Result<Value, (i32, Str
 /// unconditionally both fabricated tasks for unknown ids — contradicting
 /// `tasks/get`, which reports the same id as missing — and replaced a
 /// COMPLETED task's artifacts, destroying the result it had already produced.
-async fn handle_cancel(state: &AppState, params: &Value) -> Result<Value, (i32, String)> {
+async fn handle_cancel(
+    state: &AppState,
+    owner: &str,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
     let task_id = params.get("id").and_then(Value::as_str).ok_or((
         CODE_INVALID_PARAMS,
         "Missing required parameter: id".to_string(),
     ))?;
+
+    // Another principal's task is reported as missing, not as forbidden.
+    if !is_owned_by(state, task_id, owner) {
+        return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
+    }
 
     let stored = state
         .task_store
@@ -734,6 +806,30 @@ fn notify_push(state: &AppState, task_id: &str, event: &StreamEvent) {
         }
         tracing::warn!("push notification delivery to {url} failed after retries");
     });
+}
+
+/// Record which principal a task belongs to.
+fn register_owner(state: &AppState, task_id: &str, owner: &str) {
+    state
+        .task_owners
+        .lock()
+        .unwrap()
+        .insert(task_id.to_string(), owner.to_string());
+}
+
+/// Whether `owner` may read or cancel `task_id`.
+///
+/// Fails closed: a task with no recorded owner is visible to nobody. The
+/// ownership map lives in process memory, so a custom [`TaskStore`] that
+/// outlives the process would need to carry the owner itself — that is a
+/// `TaskStore` trait change and is deliberately not made here.
+fn is_owned_by(state: &AppState, task_id: &str, owner: &str) -> bool {
+    state
+        .task_owners
+        .lock()
+        .unwrap()
+        .get(task_id)
+        .is_some_and(|task_owner| task_owner == owner)
 }
 
 fn register_cancel(state: &AppState, task_id: &str, token: CancelToken) {

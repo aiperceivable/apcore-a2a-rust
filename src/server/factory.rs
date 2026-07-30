@@ -116,6 +116,7 @@ impl A2AServerFactory {
             explorer_card,
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
             push_configs: Arc::new(Mutex::new(HashMap::new())),
+            task_owners: Arc::new(Mutex::new(HashMap::new())),
             http: reqwest::Client::new(),
         };
 
