@@ -14,8 +14,10 @@ use apcore::cancel::CancelToken;
 use apcore::context::Identity;
 use apcore::errors::{ErrorCode, ModuleError};
 use axum::{
+    body::Bytes,
     extract::{FromRequestParts, State},
     http::request::Parts,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     response::{Html, IntoResponse, Response},
     Json,
@@ -144,6 +146,8 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+const CODE_PARSE_ERROR: i32 = -32700;
+const CODE_INVALID_REQUEST: i32 = -32600;
 const CODE_METHOD_NOT_FOUND: i32 = -32601;
 const CODE_INVALID_PARAMS: i32 = -32602;
 const CODE_TASK_NOT_FOUND: i32 = -32001;
@@ -210,12 +214,87 @@ fn failure_text(err: &ModuleError) -> String {
     }
 }
 
+/// Reject a request whose `Content-Type` is present but not JSON (HTTP 415,
+/// per the spec's transport error table). A missing header is tolerated, as in
+/// the upstream A2A Python dispatcher, which has no content-type guard at all.
+fn unsupported_media_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            let media_type = value.split(';').next().unwrap_or("").trim();
+            !media_type.eq_ignore_ascii_case("application/json")
+                && !media_type.ends_with("+json")
+                && !media_type.is_empty()
+        })
+}
+
+/// Validate the JSON-RPC 2.0 envelope, returning the error response body when
+/// it is malformed.
+///
+/// A missing `id` is deliberately not an error: that is a notification, which
+/// is valid JSON-RPC 2.0, and both upstream A2A servers answer it (with
+/// `"id": null`) rather than rejecting it.
+fn envelope_error(req: &Value) -> Option<Value> {
+    if req.is_array() {
+        // Neither upstream server implements batching; a2a-python rejects it
+        // explicitly with this code and message, which is the JSON-RPC-correct
+        // answer (a2a-js only reaches -32602 by falling through its validator).
+        return Some(rpc_error(
+            &Value::Null,
+            CODE_INVALID_REQUEST,
+            "Batch requests are not supported",
+        ));
+    }
+    if !req.is_object() {
+        return Some(rpc_error(
+            &Value::Null,
+            CODE_INVALID_REQUEST,
+            "Invalid Request",
+        ));
+    }
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    match req.get("jsonrpc").and_then(Value::as_str) {
+        Some("2.0") => {}
+        Some(_) => {
+            return Some(rpc_error(
+                &id,
+                CODE_INVALID_REQUEST,
+                "Invalid Request: jsonrpc must be '2.0'",
+            ))
+        }
+        None => return Some(rpc_error(&id, CODE_INVALID_REQUEST, "Invalid Request")),
+    }
+    if req.get("method").and_then(Value::as_str).is_none() {
+        return Some(rpc_error(&id, CODE_INVALID_REQUEST, "Invalid Request"));
+    }
+    None
+}
+
 /// JSON-RPC dispatch entry point (`POST /`).
+///
+/// Takes the raw body rather than `Json<Value>` so unparseable input becomes a
+/// JSON-RPC `-32700` response instead of axum's `text/plain` 400, which no
+/// JSON-RPC client can read.
 pub async fn jsonrpc_handler(
     State(state): State<AppState>,
     AuthIdentity(identity): AuthIdentity,
-    Json(req): Json<Value>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    if unsupported_media_type(&headers) {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "Unsupported media type").into_response();
+    }
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return Json(rpc_error(&Value::Null, CODE_PARSE_ERROR, "Parse error")).into_response()
+        }
+    };
+    if let Some(error) = envelope_error(&req) {
+        return Json(error).into_response();
+    }
+
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);

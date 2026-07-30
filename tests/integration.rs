@@ -597,6 +597,109 @@ async fn unknown_method_is_method_not_found() {
     assert_eq!(resp["error"]["code"], json!(-32601));
 }
 
+/// POST a raw body (not necessarily valid JSON) to the JSON-RPC endpoint.
+async fn post_raw(router: axum::Router, body: &str) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn malformed_json_is_a_parse_error_not_a_plain_text_400() {
+    // Unparseable input used to fall to axum's `Json` rejection: HTTP 400 with a
+    // text/plain body, which no JSON-RPC client can read.
+    let (status, body) = post_raw(build().await, "{not json").await;
+    assert_eq!(status, StatusCode::OK);
+    let resp: Value = serde_json::from_slice(&body).expect("a JSON-RPC body");
+    assert_eq!(resp["jsonrpc"], json!("2.0"));
+    assert_eq!(resp["error"]["code"], json!(-32700));
+    assert_eq!(resp["id"], Value::Null);
+}
+
+#[tokio::test]
+async fn wrong_jsonrpc_version_is_invalid_request() {
+    let (_status, resp) = post_rpc(
+        build().await,
+        json!({ "jsonrpc": "1.0", "id": "1", "method": "tasks/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32600));
+    // The id is echoed, so a client can correlate the rejection.
+    assert_eq!(resp["id"], json!("1"));
+}
+
+#[tokio::test]
+async fn missing_jsonrpc_or_method_is_invalid_request() {
+    let (_status, no_version) = post_rpc(
+        build().await,
+        json!({ "id": "1", "method": "tasks/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(no_version["error"]["code"], json!(-32600));
+
+    // Previously a missing `method` reported -32601 "Method not found", which
+    // describes a well-formed request naming an unknown method.
+    let (_status, no_method) = post_rpc(
+        build().await,
+        json!({ "jsonrpc": "2.0", "id": "1", "params": {} }),
+    )
+    .await;
+    assert_eq!(no_method["error"]["code"], json!(-32600));
+}
+
+#[tokio::test]
+async fn batch_request_is_rejected_as_invalid_request() {
+    // Neither upstream A2A server implements batching. a2a-python rejects it
+    // explicitly with -32600; Rust used to report -32601, which claims the
+    // array itself named an unknown method.
+    let (_status, resp) = post_rpc(
+        build().await,
+        json!([{ "jsonrpc": "2.0", "id": "1", "method": "tasks/list", "params": {} }]),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32600));
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Batch requests are not supported"));
+}
+
+#[tokio::test]
+async fn notification_is_answered_with_a_null_id() {
+    // Locked deliberately: strict JSON-RPC 2.0 says a notification gets no
+    // response, but both upstream A2A servers answer it with `"id": null`
+    // (a2a-python jsonrpc_dispatcher.py, a2a-js jsonrpc_transport_handler.ts:87
+    // `id: requestId = null`), and neither has a notification code path. Rust
+    // follows the transport authority rather than diverging alone.
+    let (status, resp) = post_rpc(
+        build().await,
+        json!({ "jsonrpc": "2.0", "method": "tasks/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resp["id"], Value::Null);
+    assert!(resp["result"]["tasks"].is_array());
+}
+
+#[tokio::test]
+async fn non_json_content_type_is_unsupported_media_type() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "text/plain")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = build().await.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
 /// Test authenticator: accepts `Authorization: Bearer good` as principal `u1`
 /// and `Bearer other` as principal `u2`; rejects anything else.
 struct TestAuth;
