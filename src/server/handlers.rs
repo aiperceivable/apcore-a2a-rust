@@ -307,9 +307,23 @@ fn rpc_error(id: &Value, code: i32, message: &str) -> Value {
 /// result: StreamResponse.toJSON(event) }`). A bare payload cannot be parsed by
 /// an off-the-shelf `a2a-python` / `a2a-js` client.
 ///
-/// No `kind` discriminator, no `final` flag and no SSE `id:` line: A2A 1.0
-/// discriminates by the `oneof` wrapper key, dropped `final` in favour of the
-/// terminal `TaskState`, and neither upstream server emits SSE `id:`.
+/// No `kind` discriminator and no `final` flag: A2A 1.0 discriminates by the
+/// `oneof` wrapper key and dropped `final` in favour of the terminal
+/// `TaskState`. Both the spec repo and both upstream SDKs agree on those two.
+///
+/// The absent SSE `id:` line is a **deliberate deviation from the spec repo**,
+/// not a case of the same agreement. `docs/spec/srs.md` ("SSE event format"),
+/// `docs/features/streaming.md` (`_format_sse_event(event, event_id)`) and
+/// `docs/spec/tech-design.md` ("Assign monotonic id") all mandate a monotonic
+/// `id:`. Neither upstream server emits one — a2a-python's `_wrap_stream` and
+/// a2a-js's `jsonrpc_transport_handler.ts` yield `data:` only — so emitting it
+/// would put this server alone on the wire, and it buys nothing today because
+/// `tasks/resubscribe` / `Last-Event-ID` replay is not implemented. Revisit
+/// together with resubscribe support, or amend the spec.
+///
+/// The three refusals are recorded separately because the earlier comment
+/// presented all three as backed by both the spec and both SDKs, which is true
+/// of two of them.
 fn sse_event(id: &Value, event: &StreamEvent) -> Event {
     let payload = serde_json::to_value(event).unwrap_or(Value::Null);
     Event::default()

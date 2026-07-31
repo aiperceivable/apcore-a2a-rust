@@ -54,8 +54,16 @@ Conformance and correctness fixes on the A2A server path, from
 - **SSE frames are JSON-RPC responses.** Each `data:` now carries
   `{"jsonrpc","id","result":<event>}`, matching a2a-python and a2a-js, so an
   off-the-shelf A2A client can parse the stream. Event ordering, the terminal
-  `lastChunk` marker and the `oneof` wrapper keys are unchanged; `kind`,
-  `final` and SSE `id:` lines remain absent, as A2A 1.0 requires.
+  `lastChunk` marker and the `oneof` wrapper keys are unchanged; `kind` and
+  `final` remain absent, as A2A 1.0 requires.
+
+  The SSE `id:` line also remains absent, but that is a **deviation from the
+  spec repo**, which mandates a monotonic `id:` in three places
+  (`docs/spec/srs.md`, `docs/features/streaming.md`,
+  `docs/spec/tech-design.md`). Neither a2a-python nor a2a-js emits one, so
+  emitting it would put this server alone on the wire, and it buys nothing
+  until `tasks/resubscribe` / `Last-Event-ID` replay exists. To be revisited
+  with resubscribe support, or by amending the spec.
 - **`"role": "user"` is accepted.** The lowercase A2A 0.3 spellings are
   deserialization aliases (`ROLE_*` is still what is serialized), and an
   unreadable `message` now reports what actually failed to parse instead of
