@@ -45,6 +45,12 @@ Conformance and correctness fixes on the A2A server path, from
   JSON-RPC response instead of a `text/plain` HTTP 400; a `"jsonrpc"` other
   than `"2.0"`, a missing `jsonrpc`/`method`, and a batch array all return
   `-32600` (previously accepted, or reported as `-32601`).
+
+  A missing `id` is deliberately *not* an error. That is a JSON-RPC 2.0
+  notification, and — like a2a-python and a2a-js — this server answers it with
+  a normal response carrying `"id": null` rather than staying silent as strict
+  JSON-RPC 2.0 would. Clients that send notifications should expect a response
+  body.
 - **SSE frames are JSON-RPC responses.** Each `data:` now carries
   `{"jsonrpc","id","result":<event>}`, matching a2a-python and a2a-js, so an
   off-the-shelf A2A client can parse the stream. Event ordering, the terminal
@@ -56,6 +62,24 @@ Conformance and correctness fixes on the A2A server path, from
   claiming the parameter was missing.
 - **`VERSION` tracks the crate version** (`CARGO_PKG_VERSION`) rather than a
   hand-maintained literal that had drifted to `0.4.1`.
+
+### Changed
+
+- **Source-breaking changes to the `server::handlers` surface.** The documented
+  entry points (`build_app`, `build_app_with_auth`, `serve`, `async_serve`,
+  `APCoreA2AConfig`, `BackendSource`) are unchanged; only code that constructs
+  an `AppState` by hand or names the handler functions is affected.
+
+  - `AppState` gained two required fields, `input_schemas` and `task_owners`,
+    so struct-literal construction no longer compiles.
+  - `AppState::agent_card` and `AppState::explorer_card` change from
+    `Arc<Value>` to `Arc<FilteredCard>` (`.unfiltered()` returns the original
+    `Arc<Value>`, `.for_caller(...)` the ACL-filtered copy).
+  - `AppState::task_owners` is `Arc<Mutex<TaskOwners>>`, not
+    `Arc<Mutex<HashMap<String, String>>>`.
+  - `explorer_card` gained an `AuthIdentity` extractor argument (it must know
+    the caller to filter the card). As an axum handler it is still routed the
+    same way; only a direct call has to change.
 
 ### Security
 
@@ -77,8 +101,24 @@ Conformance and correctness fixes on the A2A server path, from
   grew by one entry per submitted task for the process lifetime. Eviction is
   fail-closed: an evicted task becomes unreachable to its owner rather than
   reachable by anyone else.
-  With no authenticator configured all callers share one owner, as upstream's
-  `UnauthenticatedUser` does, so single-tenant deployments are unaffected.
+
+  Callers with no `Identity` share a single `""` owner bucket, as upstream's
+  `UnauthenticatedUser` does — that covers both "no authenticator configured"
+  and "an authenticator configured with `require_auth = false` that did not
+  authenticate this request". Single-tenant deployments are unaffected; a
+  permissive-mode deployment gets scoping only between authenticated callers,
+  with every unauthenticated caller sharing one bucket.
+
+  **Behaviour change for a non-default `TaskStore`.** Ownership is recorded in
+  process memory and `is_owned_by` fails closed, so after a restart with a
+  consumer-supplied persistent store the map is empty and every persisted task
+  is unreachable to its genuine owner — `tasks/get` / `tasks/cancel` and the
+  three push-config methods return `-32001`, `tasks/list` returns `[]`. The
+  same applies to a task evicted under the cap above. Carrying the owner across
+  a restart requires the `TaskStore` trait to carry it, which is a breaking
+  trait change and is deliberately not made here. Deployments using the default
+  `InMemoryTaskStore` are unaffected, since its contents do not survive a
+  restart either.
 - **The Agent Card advertises only ACL-allowed skills, and the filter agrees
   with enforcement.** The ACL gated the call but not the advertisement, so a
   deny-all-but-one ACL still disclosed the whole module inventory. The filter
