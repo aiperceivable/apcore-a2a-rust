@@ -403,7 +403,7 @@ fn error_to_status(err: &ModuleError) -> TaskStatus {
 fn failure_text(err: &ModuleError) -> String {
     let message = ErrorMapper::to_jsonrpc_error(err).message;
     match err.ai_guidance.as_deref() {
-        Some(guidance) if carries_caller_detail(err.code) && !guidance.trim().is_empty() => {
+        Some(guidance) if carries_caller_detail(err) && !guidance.trim().is_empty() => {
             format!("{message} ({})", sanitize_message(guidance))
         }
         _ => message,

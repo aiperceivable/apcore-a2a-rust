@@ -32,6 +32,17 @@ impl ErrorMapper {
                 code: CODE_METHOD_NOT_FOUND,
                 message: sanitize_message(&error.message),
             },
+            // apcore raises SCHEMA_VALIDATION_ERROR for output and config
+            // validation too, neither of which the caller can do anything
+            // about — see `is_server_side_schema_error`.
+            ApcoreErrorCode::SchemaValidationError
+                if is_server_side_schema_error(&error.message) =>
+            {
+                JsonRpcError {
+                    code: CODE_INTERNAL_ERROR,
+                    message: "Internal server error".to_string(),
+                }
+            }
             ApcoreErrorCode::SchemaValidationError => JsonRpcError {
                 code: CODE_INVALID_PARAMS,
                 message: sanitize_message(&error.message),
@@ -98,13 +109,38 @@ impl ErrorMapper {
 /// `error_mapper_message_policy_matches_to_jsonrpc_error` locks this to the
 /// match in [`ErrorMapper::to_jsonrpc_error`] across every apcore error code, so
 /// the two cannot drift.
-pub(crate) fn carries_caller_detail(code: ApcoreErrorCode) -> bool {
-    matches!(
-        code,
-        ApcoreErrorCode::ModuleNotFound
-            | ApcoreErrorCode::SchemaValidationError
-            | ApcoreErrorCode::GeneralInvalidInput
-    )
+pub(crate) fn carries_caller_detail(error: &ModuleError) -> bool {
+    match error.code {
+        ApcoreErrorCode::ModuleNotFound | ApcoreErrorCode::GeneralInvalidInput => true,
+        ApcoreErrorCode::SchemaValidationError => !is_server_side_schema_error(&error.message),
+        _ => false,
+    }
+}
+
+/// Whether a `SCHEMA_VALIDATION_ERROR` is about something the *server* produced
+/// rather than something the caller sent.
+///
+/// apcore raises the one code for all three directions —
+/// `executor::validate_against_schema(value, schema, direction)` is called with
+/// `"Input"`, `"Output"` (`executor.rs`, on the module's own result) and
+/// `"Config"` (`config.rs`). Reporting an output- or config-validation failure
+/// as `-32602 Invalid params` tells the caller to fix a request that was
+/// correct, and its `ai_guidance` points at a `details.errors` field an A2A
+/// caller never receives. Those are server-side defects and belong behind the
+/// fixed internal string.
+///
+/// The direction label apcore puts at the front of the message is the only
+/// signal that exists, so this matches apcore's two exact wordings rather than
+/// a loose prefix. Anything unrecognized keeps the caller-facing detail —
+/// including a module that raises the code itself with its own wording, whose
+/// message srs FR-ERR-002 requires the caller to see. Failing to recognize a
+/// server-side error therefore preserves today's behaviour; it never masks a
+/// caller-fixable one by mistake.
+fn is_server_side_schema_error(message: &str) -> bool {
+    ["Output", "Config"].iter().any(|direction| {
+        message == format!("{direction} validation failed")
+            || message.starts_with(&format!("{direction} schema is invalid: "))
+    })
 }
 
 /// Strip paths, tracebacks and excess whitespace from text bound for a caller.
@@ -276,15 +312,58 @@ mod tests {
         // so adding a code or an arm cannot silently desync the two.
         const SENTINEL: &str = "canary-2f8a";
         for &code in ApcoreErrorCode::ALL {
-            let mapped = ErrorMapper::to_jsonrpc_error(&make_error(code, SENTINEL));
+            let err = make_error(code, SENTINEL);
+            let mapped = ErrorMapper::to_jsonrpc_error(&err);
             assert_eq!(
                 mapped.message.contains(SENTINEL),
-                carries_caller_detail(code),
+                carries_caller_detail(&err),
                 "{code:?}: to_jsonrpc_error forwards the message = {}, \
                  carries_caller_detail = {}",
                 mapped.message.contains(SENTINEL),
-                carries_caller_detail(code),
+                carries_caller_detail(&err),
             );
+        }
+        // The one code whose policy is not decided by the code alone.
+        for message in [
+            "Output validation failed",
+            "Config validation failed",
+            "Output schema is invalid: bad $ref",
+        ] {
+            let err = make_error(ApcoreErrorCode::SchemaValidationError, message);
+            assert!(!carries_caller_detail(&err), "{message}");
+            assert_eq!(
+                ErrorMapper::to_jsonrpc_error(&err).message,
+                "Internal server error",
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_validation_failure_is_not_reported_as_caller_fixable() {
+        // apcore raises SCHEMA_VALIDATION_ERROR for output validation too
+        // (`validate_against_schema(&merged, &setup.output_schema, "Output")`),
+        // so a module returning the wrong shape reached the caller as
+        // `-32602 Invalid params` — telling them to fix a correct request, and
+        // pointing at a `details` field an A2A caller never receives.
+        let err = make_error(
+            ApcoreErrorCode::SchemaValidationError,
+            "Output validation failed",
+        )
+        .with_ai_guidance("Output failed schema validation. Check the 'errors' field in details.");
+        let resp = ErrorMapper::to_jsonrpc_error(&err);
+        assert_eq!(resp.code, CODE_INTERNAL_ERROR);
+        assert_eq!(resp.message, "Internal server error");
+
+        // Input validation — the caller-fixable direction — is untouched, and
+        // so is a module raising the code with its own wording.
+        for message in ["Input validation failed", "width: must be integer"] {
+            let resp = ErrorMapper::to_jsonrpc_error(&make_error(
+                ApcoreErrorCode::SchemaValidationError,
+                message,
+            ));
+            assert_eq!(resp.code, CODE_INVALID_PARAMS, "{message}");
+            assert_eq!(resp.message, message, "{message}");
         }
     }
 }

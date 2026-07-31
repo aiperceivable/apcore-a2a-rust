@@ -32,6 +32,17 @@ Conformance and correctness fixes on the A2A server path, from
   `sanitize_message` does not strip (module ids, versions, env-var names,
   hostnames). A unit test now locks the gate to `ErrorMapper`'s own branching
   across every apcore error code.
+
+  `SCHEMA_VALIDATION_ERROR` is no longer treated as caller-fixable in every
+  direction. apcore raises the one code for input, **output** and config
+  validation, so a module returning the wrong shape reached the caller as
+  `-32602 Invalid params` with `"Output validation failed"` and guidance
+  pointing at a `details.errors` field an A2A caller never receives — a
+  server-side defect reported as the caller's fault. Output and config
+  validation now map to the fixed internal string. The direction label apcore
+  puts at the front of the message is the only signal available, so the two
+  exact wordings are matched; anything unrecognized (including a module raising
+  the code with its own wording) keeps the caller-facing detail.
 - **`tasks/cancel` is guarded.** Unknown ids return `-32001` instead of
   fabricating a CANCELED task, terminal tasks return `-32002` instead of having
   their artifacts destroyed, and a cancelled task keeps the artifacts and
