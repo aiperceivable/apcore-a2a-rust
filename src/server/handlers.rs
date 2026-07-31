@@ -132,11 +132,14 @@ impl TaskOwners {
 ///
 /// Mirrors the upstream A2A stores, which scope task storage by an owner
 /// resolved from the call context (`a2a-python`'s `OwnerResolver`, whose
-/// default is `context.user.user_name`; `a2a-js`'s per-context bucket). When no
-/// authenticator is configured every request resolves to the same empty owner,
-/// exactly as upstream's `UnauthenticatedUser.user_name` does — a single-tenant
-/// deployment keeps its current behaviour, and configuring auth is what turns
-/// scoping on.
+/// default is `context.user.user_name`; `a2a-js`'s per-context bucket).
+///
+/// Every request without an `Identity` resolves to the same empty owner,
+/// exactly as upstream's `UnauthenticatedUser.user_name` does. That covers both
+/// "no authenticator configured" — a single-tenant deployment keeps its current
+/// behaviour — and an authenticator running with `require_auth = false`, whose
+/// unauthenticated requests all share the one bucket while authenticated ones
+/// are scoped normally.
 fn owner_key(identity: Option<&Identity>) -> String {
     identity.map(|i| i.id().to_string()).unwrap_or_default()
 }
