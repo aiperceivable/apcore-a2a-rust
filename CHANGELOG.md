@@ -59,10 +59,17 @@ Conformance and correctness fixes on the A2A server path, from
 
 ### Security
 
-- **`tasks/list` / `tasks/get` / `tasks/cancel` are scoped to the authenticated
-  principal.** `tasks/list` previously returned every caller's tasks including
-  their output, and a task could be read or cancelled by id from any caller.
-  Cross-principal access is masked as `-32001` so task ids cannot be probed.
+- **All six task-addressed methods are scoped to the authenticated principal**
+  — `tasks/list` / `tasks/get` / `tasks/cancel` and
+  `tasks/pushNotificationConfig/set|get|delete`. `tasks/list` previously
+  returned every caller's tasks including their output; a task could be read or
+  cancelled by id from any caller; and the push-config methods checked nothing
+  at all, so a principal holding another's task id could redirect that task's
+  terminal `statusUpdate` to a webhook of its choosing, or silently suppress the
+  owner's notifications by deleting their config. Only the unguessability of a
+  UUIDv4 task id stood in the way. Cross-principal access is masked as `-32001`
+  so task ids cannot be probed. The push-config methods now also require the
+  task to exist, matching `a2a-python`'s `on_set/get_task_push_notification_config`.
   With no authenticator configured all callers share one owner, as upstream's
   `UnauthenticatedUser` does, so single-tenant deployments are unaffected.
 - **The Agent Card advertises only ACL-allowed skills, and the filter agrees

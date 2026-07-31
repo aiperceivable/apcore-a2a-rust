@@ -365,18 +365,20 @@ pub async fn jsonrpc_handler(
             let tasks = handle_list(&state, &owner).await;
             Json(rpc_result(&id, json!({ "tasks": tasks }))).into_response()
         }
-        "tasks/pushNotificationConfig/set" => match handle_push_set(&state, &params) {
+        "tasks/pushNotificationConfig/set" => match handle_push_set(&state, &owner, &params) {
             Ok(v) => Json(rpc_result(&id, v)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "tasks/pushNotificationConfig/get" => match handle_push_get(&state, &params) {
+        "tasks/pushNotificationConfig/get" => match handle_push_get(&state, &owner, &params) {
             Ok(v) => Json(rpc_result(&id, v)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "tasks/pushNotificationConfig/delete" => match handle_push_delete(&state, &params) {
-            Ok(v) => Json(rpc_result(&id, v)).into_response(),
-            Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
-        },
+        "tasks/pushNotificationConfig/delete" => {
+            match handle_push_delete(&state, &owner, &params) {
+                Ok(v) => Json(rpc_result(&id, v)).into_response(),
+                Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
+            }
+        }
         _ => Json(rpc_error(&id, CODE_METHOD_NOT_FOUND, "Method not found")).into_response(),
     }
 }
@@ -910,12 +912,34 @@ async fn handle_cancel(
     Ok(task_json)
 }
 
-/// `tasks/pushNotificationConfig/set` — register a webhook for a task.
-fn handle_push_set(state: &AppState, params: &Value) -> Result<Value, (i32, String)> {
+/// Read a task-addressed request's `id` and confirm the caller owns that task.
+///
+/// The six task-addressed methods must all be scoped, not just the three that
+/// read task state: a principal holding another's task id could otherwise point
+/// its terminal `statusUpdate` at an attacker-controlled webhook, or silently
+/// suppress the owner's notifications by deleting their config. Masked as
+/// "not found" like the rest (srs FR-ERR-003) so ids cannot be probed. Upstream
+/// scopes these three the same way — `a2a-python`'s
+/// `on_set/get_task_push_notification_config` both load the task from the
+/// context-scoped `task_store` first and raise `TaskNotFoundError`.
+fn owned_task_id<'a>(
+    state: &AppState,
+    owner: &str,
+    params: &'a Value,
+) -> Result<&'a str, (i32, String)> {
     let task_id = params.get("id").and_then(Value::as_str).ok_or((
         CODE_INVALID_PARAMS,
         "Missing required parameter: id".to_string(),
     ))?;
+    if !is_owned_by(state, task_id, owner) {
+        return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
+    }
+    Ok(task_id)
+}
+
+/// `tasks/pushNotificationConfig/set` — register a webhook for a task.
+fn handle_push_set(state: &AppState, owner: &str, params: &Value) -> Result<Value, (i32, String)> {
+    let task_id = owned_task_id(state, owner, params)?;
     let cfg = params.get("pushNotificationConfig").cloned().ok_or((
         CODE_INVALID_PARAMS,
         "Missing pushNotificationConfig".to_string(),
@@ -935,11 +959,8 @@ fn handle_push_set(state: &AppState, params: &Value) -> Result<Value, (i32, Stri
 }
 
 /// `tasks/pushNotificationConfig/get` — return a task's webhook config.
-fn handle_push_get(state: &AppState, params: &Value) -> Result<Value, (i32, String)> {
-    let task_id = params.get("id").and_then(Value::as_str).ok_or((
-        CODE_INVALID_PARAMS,
-        "Missing required parameter: id".to_string(),
-    ))?;
+fn handle_push_get(state: &AppState, owner: &str, params: &Value) -> Result<Value, (i32, String)> {
+    let task_id = owned_task_id(state, owner, params)?;
     match state.push_configs.lock().unwrap().get(task_id) {
         Some(cfg) => Ok(json!({ "taskId": task_id, "pushNotificationConfig": cfg })),
         None => Err((
@@ -950,11 +971,12 @@ fn handle_push_get(state: &AppState, params: &Value) -> Result<Value, (i32, Stri
 }
 
 /// `tasks/pushNotificationConfig/delete` — remove a task's webhook config.
-fn handle_push_delete(state: &AppState, params: &Value) -> Result<Value, (i32, String)> {
-    let task_id = params.get("id").and_then(Value::as_str).ok_or((
-        CODE_INVALID_PARAMS,
-        "Missing required parameter: id".to_string(),
-    ))?;
+fn handle_push_delete(
+    state: &AppState,
+    owner: &str,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let task_id = owned_task_id(state, owner, params)?;
     state.push_configs.lock().unwrap().remove(task_id);
     Ok(Value::Null)
 }

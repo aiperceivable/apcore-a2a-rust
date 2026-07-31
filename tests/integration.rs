@@ -1236,12 +1236,18 @@ async fn explorer_serves_html_and_card() {
 #[tokio::test]
 async fn push_config_set_get_delete() {
     let router = build().await;
+    // The three push-config methods are task-addressed and now require the
+    // caller to own the task, so the id has to be a real one.
+    let task_id = send_to(router.clone(), "test.echo").await["result"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
     let cfg = json!({ "url": "https://hook.example.com/n", "token": "t1" });
 
     let (_s, set) = post_rpc(
         router.clone(),
         json!({"jsonrpc":"2.0","id":"1","method":"tasks/pushNotificationConfig/set",
-               "params":{"id":"task-1","pushNotificationConfig":cfg}}),
+               "params":{"id":task_id,"pushNotificationConfig":cfg}}),
     )
     .await;
     assert_eq!(
@@ -1251,7 +1257,7 @@ async fn push_config_set_get_delete() {
 
     let (_s, got) = post_rpc(
         router.clone(),
-        json!({"jsonrpc":"2.0","id":"2","method":"tasks/pushNotificationConfig/get","params":{"id":"task-1"}}),
+        json!({"jsonrpc":"2.0","id":"2","method":"tasks/pushNotificationConfig/get","params":{"id":task_id}}),
     )
     .await;
     assert_eq!(
@@ -1261,15 +1267,98 @@ async fn push_config_set_get_delete() {
 
     let (_s, _del) = post_rpc(
         router.clone(),
-        json!({"jsonrpc":"2.0","id":"3","method":"tasks/pushNotificationConfig/delete","params":{"id":"task-1"}}),
+        json!({"jsonrpc":"2.0","id":"3","method":"tasks/pushNotificationConfig/delete","params":{"id":task_id}}),
     )
     .await;
     let (_s, after) = post_rpc(
         router,
-        json!({"jsonrpc":"2.0","id":"4","method":"tasks/pushNotificationConfig/get","params":{"id":"task-1"}}),
+        json!({"jsonrpc":"2.0","id":"4","method":"tasks/pushNotificationConfig/get","params":{"id":task_id}}),
     )
     .await;
     assert_eq!(after["error"]["code"], json!(-32001));
+}
+
+#[tokio::test]
+async fn push_config_is_scoped_to_the_authenticated_principal() {
+    // `tasks/pushNotificationConfig/*` bypassed the ownership check entirely,
+    // so a principal holding another's task id could point its terminal
+    // `statusUpdate` at an attacker-controlled webhook (`/set`) or silently
+    // suppress the owner's notifications (`/delete`). Only UUIDv4 task ids
+    // stood in the way.
+    let app = build_with_auth().await;
+
+    let task_id = post_rpc_as(
+        app.clone(),
+        "good",
+        json!({
+            "jsonrpc": "2.0", "id": "1", "method": "message/send",
+            "params": {
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "data": {} }] },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await["result"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    // u1 owns it and may configure it.
+    let mine = post_rpc_as(
+        app.clone(),
+        "good",
+        json!({"jsonrpc":"2.0","id":"2","method":"tasks/pushNotificationConfig/set",
+               "params":{"id":task_id,"pushNotificationConfig":{"url":"https://ok.example/n"}}}),
+    )
+    .await;
+    assert_eq!(
+        mine["result"]["pushNotificationConfig"]["url"],
+        json!("https://ok.example/n")
+    );
+
+    // u2 holding the same id reaches none of the three, and the id's existence
+    // is not disclosed.
+    for (id, method, params) in [
+        (
+            "3",
+            "tasks/pushNotificationConfig/set",
+            json!({"id":task_id,"pushNotificationConfig":{"url":"https://attacker.example/n"}}),
+        ),
+        (
+            "4",
+            "tasks/pushNotificationConfig/get",
+            json!({"id":task_id}),
+        ),
+        (
+            "5",
+            "tasks/pushNotificationConfig/delete",
+            json!({"id":task_id}),
+        ),
+    ] {
+        let stolen = post_rpc_as(
+            app.clone(),
+            "other",
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )
+        .await;
+        assert_eq!(
+            stolen["error"]["code"],
+            json!(-32001),
+            "{method}: {stolen:?}"
+        );
+    }
+
+    // The owner's config is intact: neither overwritten nor deleted.
+    let after = post_rpc_as(
+        app,
+        "good",
+        json!({"jsonrpc":"2.0","id":"6","method":"tasks/pushNotificationConfig/get","params":{"id":task_id}}),
+    )
+    .await;
+    assert_eq!(
+        after["result"]["pushNotificationConfig"]["url"],
+        json!("https://ok.example/n")
+    );
 }
 
 #[tokio::test]
