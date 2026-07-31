@@ -54,11 +54,32 @@ Conformance and correctness fixes on the A2A server path, from
   Cross-principal access is masked as `-32001` so task ids cannot be probed.
   With no authenticator configured all callers share one owner, as upstream's
   `UnauthenticatedUser` does, so single-tenant deployments are unaffected.
-- **The Agent Card advertises only ACL-allowed skills.** The ACL gated the call
-  but not the advertisement, so a deny-all-but-one ACL still disclosed the whole
-  module inventory. Filtering is per caller; the auth middleware now identifies
-  callers on exempt paths (without rejecting them) so an authenticated client
-  is not evaluated as `@external`.
+- **The Agent Card advertises only ACL-allowed skills, and the filter agrees
+  with enforcement.** The ACL gated the call but not the advertisement, so a
+  deny-all-but-one ACL still disclosed the whole module inventory. The filter
+  now evaluates each skill exactly as apcore's pipeline does — against
+  `acl_context(identity).child(skill_id)`, using that context's own `caller_id`
+  — instead of against the authenticated principal with a `None` context. The
+  first version of this filter got both halves wrong in opposite directions: a
+  `callers: ["@external"] … deny` rule matched on the call path but not on the
+  card, so an authenticated caller was advertised the entire inventory and then
+  refused every call; and a rule carrying a `conditions:` block was silently
+  inert on the card path (apcore's `check_conditions` returns false without a
+  context) while it stayed live on the call path.
+
+  **Known limitation (apcore 0.26): an ACL `callers:` entry other than
+  `@external` can never match an inbound A2A request.** The standard pipeline
+  runs `BuiltinCallChainGuard` before `BuiltinACLCheck`, and that step replaces
+  the context with `Context::child(module_id)`, which re-derives `caller_id`
+  from `call_chain.last()` — empty on a top-level call. A host cannot set the
+  caller from outside apcore; `Context::child` would have to preserve an
+  explicitly-set top-level `caller_id`. The same limitation makes the audit
+  trail's caller dimension, the circuit breaker's per-caller key and the
+  obs/otel caller attribute permanently anonymous. Until apcore changes,
+  discriminate callers with an `identity_types` / `roles` condition, which is
+  evaluated against the identity and does reach the ACL. The adapter now passes
+  the authenticated identity as `caller_id` on the context it builds, so both
+  surfaces pick up the real principal the moment apcore preserves it.
 
 ## [0.4.4] - 2026-07-14
 

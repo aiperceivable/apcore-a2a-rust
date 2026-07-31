@@ -801,14 +801,17 @@ impl apcore_a2a::Authenticator for TestAuth {
         &self,
         headers: &std::collections::HashMap<String, String>,
     ) -> Option<apcore::context::Identity> {
-        let principal = match headers.get("authorization").map(String::as_str) {
-            Some("Bearer good") => "u1",
-            Some("Bearer other") => "u2",
+        // `weak` is a principal of a *different* identity type, so an ACL
+        // `identity_types` condition can tell it apart from `u1` / `u2`.
+        let (principal, identity_type) = match headers.get("authorization").map(String::as_str) {
+            Some("Bearer good") => ("u1", "test"),
+            Some("Bearer other") => ("u2", "test"),
+            Some("Bearer weak") => ("u3", "untrusted"),
             _ => return None,
         };
         Some(apcore::context::Identity::new(
             principal.into(),
-            "test".into(),
+            identity_type.into(),
             vec![],
             std::collections::HashMap::new(),
         ))
@@ -943,6 +946,139 @@ async fn task_reads_are_scoped_to_the_authenticated_principal() {
     )
     .await;
     assert_eq!(stolen_cancel["error"]["code"], json!(-32001));
+}
+
+/// Fetch the Agent Card as the principal behind `bearer` and return its skill ids.
+async fn advertised_skills(router: axum::Router, bearer: &str) -> Vec<String> {
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    let card = body_json(router.oneshot(req).await.unwrap()).await;
+    card["skills"]
+        .as_array()
+        .expect("skills array")
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Whether `bearer`'s principal can actually invoke `skill_id`.
+///
+/// An ACL denial reaches the caller as a FAILED task masked with the same
+/// "Task not found" string a missing task gets (srs FR-ERR-003), which is
+/// exactly what distinguishes "refused by the ACL" from "ran and failed"
+/// (`test.guard` fails with an invalid-input message, not this one).
+async fn is_callable(router: axum::Router, bearer: &str, skill_id: &str) -> bool {
+    let sent = post_rpc_as(
+        router,
+        bearer,
+        json!({
+            "jsonrpc": "2.0", "id": "1", "method": "message/send",
+            "params": {
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "data": {} }] },
+                "metadata": { "skillId": skill_id }
+            }
+        }),
+    )
+    .await;
+    let text = sent["result"]["status"]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    text != "Task not found"
+}
+
+#[tokio::test]
+async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
+    // The card filter evaluated the authenticated principal while the call
+    // path evaluated `@external` (see `ApCoreAgentExecutor::build_context`:
+    // apcore's `BuiltinCallChainGuard` re-derives `caller_id` from an empty
+    // `call_chain` before `BuiltinACLCheck` runs, so no host can name the
+    // caller). It also passed `ctx: None`, which makes apcore's
+    // `check_conditions` return false unconditionally — so a rule carrying a
+    // `conditions:` block was inert on the card path and live on the call path.
+    //
+    // Under the ACL below that produced both failure directions at once: `u1`
+    // was advertised `test.internal` (rule 2, which the enforcement path can
+    // never match) and refused every call to it, while `test.echo` /
+    // `test.guard` were callable (rule 3) but hidden, because rule 3's
+    // condition could not be evaluated without a context.
+    //
+    // This test drives *both* surfaces with one ACL and asserts they agree.
+    use apcore::acl::{ACLRule, ACL};
+    use apcore::config::Config;
+    use apcore::executor::Executor;
+
+    let rule =
+        |callers: &[&str], targets: &[&str], effect: &str, conditions: Option<Value>| ACLRule {
+            callers: callers.iter().map(|c| (*c).to_string()).collect(),
+            targets: targets.iter().map(|t| (*t).to_string()).collect(),
+            effect: effect.to_string(),
+            description: None,
+            conditions,
+        };
+    let acl = ACL::new(
+        vec![
+            // 1. Two skills are off-limits to unauthenticated callers — which,
+            //    on the enforcement path, is every caller.
+            rule(
+                &["@external"],
+                &["test.internal", "test.slow"],
+                "deny",
+                None,
+            ),
+            // 2. A rule naming a principal by id. apcore never delivers a
+            //    caller id other than `@external` to a top-level call, so this
+            //    rule is inert — and the card must not pretend otherwise.
+            rule(&["u1"], &["test.internal"], "allow", None),
+            // 3. What actually discriminates callers today: a condition on the
+            //    identity, which does survive into the ACL check.
+            rule(
+                &["*"],
+                &["*"],
+                "allow",
+                Some(json!({ "identity_types": ["test"] })),
+            ),
+        ],
+        "deny",
+        None,
+    );
+    let mut executor = Executor::new(echo_registry(), Config::default());
+    executor.set_acl(acl);
+
+    let (app, _card) = apcore_a2a::build_app_with_auth(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+        Some(Arc::new(TestAuth)),
+    )
+    .await
+    .expect("build app with auth");
+
+    let all_skills = ["test.echo", "test.guard", "test.internal", "test.slow"];
+    for principal in ["good", "weak"] {
+        let advertised = advertised_skills(app.clone(), principal).await;
+        let mut callable: Vec<String> = vec![];
+        for skill in all_skills {
+            if is_callable(app.clone(), principal, skill).await {
+                callable.push(skill.to_string());
+            }
+        }
+        assert_eq!(
+            advertised, callable,
+            "the card filter and the ACL must agree for principal {principal}"
+        );
+    }
+
+    // And the agreed-on answer is the right one: the trusted identity type
+    // gets the two skills rule 3 allows and neither of the two rule 1 denies;
+    // the untrusted one gets nothing.
+    assert_eq!(
+        advertised_skills(app.clone(), "good").await,
+        vec!["test.echo".to_string(), "test.guard".to_string()],
+    );
+    assert!(advertised_skills(app, "weak").await.is_empty());
 }
 
 #[tokio::test]

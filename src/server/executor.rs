@@ -6,6 +6,7 @@
 //! `tasks/cancel`) and a `global_deadline` derived from `execution_timeout`
 //! (bounds both the single-shot and streaming paths).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::adapters::parts::PartConverter;
+
+/// apcore's sentinel for an unauthenticated caller. Mirrors
+/// `apcore::sys_modules::DEFAULT_EXTERNAL_CALLER`, which is crate-private there.
+const EXTERNAL_CALLER: &str = "@external";
 
 /// Executes A2A tasks by delegating to an apcore [`ApcoreExecutor`].
 pub struct ApCoreAgentExecutor {
@@ -51,9 +56,27 @@ impl ApCoreAgentExecutor {
         self.executor.acl.clone()
     }
 
-    /// Build an apcore `Context` carrying the cancel token and a global
-    /// deadline (`now + execution_timeout`, fractional seconds since UNIX epoch
-    /// per the apcore Rust contract).
+    /// Build an apcore `Context` carrying the caller principal, the cancel
+    /// token and a global deadline (`now + execution_timeout`, fractional
+    /// seconds since UNIX epoch per the apcore Rust contract).
+    ///
+    /// `caller_id` is set from the authenticated identity (via the builder;
+    /// `Context::create` hard-sets `caller_id: None`). An anonymous request
+    /// leaves it unset so apcore applies its own `@external` default.
+    ///
+    /// **apcore 0.26 discards this value before any consumer reads it**, so
+    /// today it changes nothing: the standard pipeline runs
+    /// `BuiltinCallChainGuard` before `BuiltinACLCheck`, and that step replaces
+    /// the whole context with `Context::child(module_id)`, which derives
+    /// `caller_id` from `call_chain.last()` — empty on a top-level call, so
+    /// `caller_id` becomes `None` again. Every inbound A2A request therefore
+    /// reaches the ACL, the audit trail, the circuit-breaker key and the
+    /// obs/otel caller attribute as `@external`, whoever sent it, and no host
+    /// can change that from outside apcore. It is set here anyway because
+    /// [`Self::acl_context`] reproduces the same `child()` derivation for the
+    /// Agent Card filter: the two surfaces agree under today's behaviour, and
+    /// would still agree — with the real principal — if apcore's `child()`
+    /// learned to preserve an explicitly-set top-level `caller_id`.
     fn build_context(
         &self,
         identity: Option<Identity>,
@@ -64,14 +87,53 @@ impl ApCoreAgentExecutor {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
         let deadline = now + self.execution_timeout_secs as f64;
-        Context::create(
-            identity,
-            None, // trace_parent
-            Some(cancel_token),
-            None,           // data
-            Value::Null,    // services
-            Some(deadline), // global_deadline
-        )
+        let caller_id = identity.as_ref().map(|id| id.id().to_string());
+        Context::builder()
+            .identity(identity)
+            .caller_id(caller_id)
+            .cancel_token(Some(cancel_token))
+            .services(Value::Null)
+            .global_deadline(Some(deadline))
+            .build()
+    }
+
+    /// Build the base `Context` an out-of-pipeline ACL decision (the Agent Card
+    /// filter) must be evaluated against.
+    ///
+    /// Discovery and enforcement have to reach the same verdict, or the card
+    /// advertises skills every call refuses, or hides skills the caller can
+    /// invoke. Rather than guess at the pipeline's behaviour, this reproduces
+    /// the two things apcore's standard pipeline does to a top-level context
+    /// before `BuiltinACLCheck` reads it:
+    ///
+    /// 1. `BuiltinContextCreation` defaults a missing `caller_id` to
+    ///    `@external` and synthesizes a matching external `Identity`;
+    /// 2. `BuiltinCallChainGuard` replaces the context with
+    ///    `Context::child(module_id)`.
+    ///
+    /// Step 1 is applied here; step 2 is per-skill, so the caller applies
+    /// `.child(skill_id)` to this base context and checks the ACL against the
+    /// result — see `server::handlers::acl_filtered_card`.
+    ///
+    /// The context itself matters as much as the principal: passing `None`
+    /// makes apcore's `check_conditions` return `false` unconditionally, so
+    /// every rule carrying a `conditions:` block was inert on the card path
+    /// while it stayed live on the call path, and `@system` (which reads
+    /// `ctx.identity`) could never match.
+    pub fn acl_context(&self, identity: Option<Identity>) -> Context<Value> {
+        let mut ctx = self.build_context(identity, CancelToken::new());
+        if ctx.caller_id.is_none() {
+            ctx.caller_id = Some(EXTERNAL_CALLER.to_string());
+            if ctx.identity.is_none() {
+                ctx.identity = Some(Identity::new(
+                    EXTERNAL_CALLER.to_string(),
+                    "external".to_string(),
+                    vec![],
+                    HashMap::new(),
+                ));
+            }
+        }
+        ctx
     }
 
     /// Single-shot execution (`message/send`). Returns the raw apcore output.

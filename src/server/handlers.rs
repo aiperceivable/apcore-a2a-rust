@@ -102,6 +102,24 @@ pub async fn explorer_card(
 ///
 /// No ACL configured is the common case and costs nothing: the cached card is
 /// returned as-is.
+///
+/// The filter and the enforcement path must reach the *same* verdict, or the
+/// card advertises skills every call will refuse, or hides skills the caller can
+/// invoke. Both failures existed: the filter evaluated the authenticated
+/// principal, while an inbound A2A request reaches apcore's `BuiltinACLCheck` as
+/// `@external` no matter who sent it, and the filter passed `ctx: None`, which
+/// makes apcore's `check_conditions` return `false` — so a rule with a
+/// `conditions:` block was inert here and live there. A `deny @external` rule
+/// therefore advertised the whole inventory to an authenticated caller and then
+/// refused every call.
+///
+/// The two surfaces now agree by construction: each skill is checked exactly as
+/// the pipeline checks it — against
+/// `ApCoreAgentExecutor::acl_context(identity).child(skill_id)`, which is what
+/// `BuiltinContextCreation` + `BuiltinCallChainGuard` hand to `BuiltinACLCheck`
+/// — using that context's own `caller_id`. Deriving the caller from `child()`
+/// instead of hardcoding `@external` keeps the agreement if apcore ever starts
+/// preserving a host-supplied top-level `caller_id`.
 pub(crate) fn acl_filtered_card(
     card: &Value,
     state: &AppState,
@@ -110,17 +128,15 @@ pub(crate) fn acl_filtered_card(
     let Some(acl) = state.executor.acl() else {
         return card.clone();
     };
-    // apcore maps a `None` caller to `@external`, so an anonymous discovery
-    // request is evaluated under the same rule an anonymous call would hit.
-    let caller = identity.map(Identity::id);
+    let base = state.executor.acl_context(identity.cloned());
 
     let mut filtered = card.clone();
     if let Some(skills) = filtered.get_mut("skills").and_then(Value::as_array_mut) {
         skills.retain(|skill| {
-            skill
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| acl.check(caller, id, None))
+            skill.get("id").and_then(Value::as_str).is_some_and(|id| {
+                let ctx = base.child(id);
+                acl.check(ctx.caller_id.as_deref(), id, Some(&ctx))
+            })
         });
     }
     filtered
