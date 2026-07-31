@@ -19,8 +19,8 @@ use crate::auth::middleware::AuthMiddlewareLayer;
 use crate::auth::protocol::Authenticator;
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::server::handlers::{
-    acl_filtered_card, explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler,
-    AppState, AuthIdentity, TaskOwners,
+    explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler, AppState, AuthIdentity,
+    FilteredCard, TaskOwners,
 };
 use crate::storage::TaskStore;
 
@@ -103,7 +103,7 @@ impl A2AServerFactory {
                     obj.insert("_inputSchemas".to_string(), Value::Object(schemas));
                 }
             }
-            Arc::new(card)
+            Arc::new(FilteredCard::new(Arc::new(card)))
         };
 
         // Known skill (module) ids for request-time validation, and their input
@@ -125,7 +125,7 @@ impl A2AServerFactory {
             task_store,
             skill_ids: Arc::new(skill_ids),
             input_schemas: Arc::new(input_schemas),
-            agent_card: Arc::new(card_value),
+            agent_card: Arc::new(FilteredCard::new(Arc::new(card_value))),
             explorer_card,
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
             push_configs: Arc::new(Mutex::new(HashMap::new())),
@@ -174,11 +174,13 @@ async fn serve_card(
     State(state): State<AppState>,
     AuthIdentity(identity): AuthIdentity,
 ) -> Json<Value> {
-    Json(acl_filtered_card(
-        &state.agent_card,
-        &state,
-        identity.as_ref(),
-    ))
+    Json(
+        state
+            .agent_card
+            .for_caller(&state.executor, identity.as_ref())
+            .as_ref()
+            .clone(),
+    )
 }
 
 fn register_a2a_namespace() {

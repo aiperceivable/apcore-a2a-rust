@@ -1082,6 +1082,67 @@ async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
 }
 
 #[tokio::test]
+async fn agent_card_filter_does_not_re_drive_the_acl_audit_sink() {
+    // `/.well-known/agent-card.json` is auth-exempt and the filter runs
+    // `ACL::check` per skill, each of which calls the consumer's audit sink —
+    // a synchronous `Fn(&AuditEntry)` that may write a file or a socket. Any
+    // anonymous client could therefore generate `skills.len()` governance
+    // entries per request at arbitrary rate, all recording `decision: "deny"`
+    // and indistinguishable from real enforcement decisions.
+    use apcore::acl::{ACLRule, AuditEntry, ACL};
+    use apcore::config::Config;
+    use apcore::executor::Executor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let entries = Arc::new(AtomicUsize::new(0));
+    let counter = entries.clone();
+    let acl = ACL::new(
+        vec![ACLRule {
+            callers: vec!["*".into()],
+            targets: vec!["test.echo".into()],
+            effect: "allow".into(),
+            description: None,
+            conditions: None,
+        }],
+        "deny",
+        Some(Arc::new(move |_: &AuditEntry| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })),
+    );
+    let mut executor = Executor::new(echo_registry(), Config::default());
+    executor.set_acl(acl);
+
+    let (app, _card) = build_app(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+    )
+    .await
+    .expect("build app");
+
+    let fetch = |app: axum::Router| async move {
+        let req = Request::builder()
+            .uri("/.well-known/agent-card.json")
+            .body(Body::empty())
+            .unwrap();
+        body_json(app.oneshot(req).await.unwrap()).await
+    };
+
+    let first = fetch(app.clone()).await;
+    let after_first = entries.load(Ordering::SeqCst);
+    assert!(after_first > 0, "the first fetch does evaluate the ACL");
+
+    for _ in 0..20 {
+        let card = fetch(app.clone()).await;
+        assert_eq!(card["skills"], first["skills"], "cached card must match");
+    }
+    assert_eq!(
+        entries.load(Ordering::SeqCst),
+        after_first,
+        "repeat discovery requests must not re-drive the audit sink"
+    );
+}
+
+#[tokio::test]
 async fn sys_modules_flag_builds_and_serves() {
     let cfg = APCoreA2AConfig {
         sys_modules: true,

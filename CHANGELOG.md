@@ -106,6 +106,18 @@ Conformance and correctness fixes on the A2A server path, from
   the authenticated identity as `caller_id` on the context it builds, so both
   surfaces pick up the real principal the moment apcore preserves it.
 
+  The filtered card is memoized per caller. `ACL::check` invokes the consumer's
+  audit sink — a synchronous `Fn(&AuditEntry)` — once per skill, and the
+  discovery path is auth-exempt, so filtering on every request let any
+  anonymous client emit `skills.len()` governance entries per request at
+  arbitrary rate (each recording `decision: "deny"`, indistinguishable from a
+  real enforcement decision) while blocking a tokio worker for as long as the
+  sink took. Memoizing is sound because an installed `ACL` cannot change for
+  the life of the process. The sink is still driven once per (caller, card):
+  apcore's public `ACL` API offers no way to suppress it — `default_effect` is
+  private, so an audit-free twin cannot be rebuilt from `rules()`, and there is
+  no `clear_audit_logger`.
+
 ## [0.4.4] - 2026-07-14
 
 Patch release. Bumps the required `apcore` floor to `0.26` to align the ecosystem on the 0.26.0 governance layer (additive, no breaking changes). No code or API changes.

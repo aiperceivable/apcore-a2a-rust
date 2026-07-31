@@ -46,9 +46,9 @@ pub struct AppState {
     /// Per-skill input schema, so an inbound `TextPart` can be parsed against
     /// the schema the module actually declares.
     pub input_schemas: Arc<HashMap<String, Value>>,
-    pub agent_card: Arc<Value>,
+    pub agent_card: Arc<FilteredCard>,
     /// Agent card enriched with per-skill `_inputSchemas` for the Explorer UI.
-    pub explorer_card: Arc<Value>,
+    pub explorer_card: Arc<FilteredCard>,
     pub cancel_tokens: Arc<Mutex<HashMap<String, CancelToken>>>,
     /// Per-task push-notification webhook configs (`tasks/pushNotificationConfig/*`).
     pub push_configs: Arc<Mutex<HashMap<String, Value>>>,
@@ -154,11 +154,13 @@ pub async fn explorer_card(
     State(state): State<AppState>,
     AuthIdentity(identity): AuthIdentity,
 ) -> Json<Value> {
-    Json(acl_filtered_card(
-        &state.explorer_card,
-        &state,
-        identity.as_ref(),
-    ))
+    Json(
+        state
+            .explorer_card
+            .for_caller(&state.executor, identity.as_ref())
+            .as_ref()
+            .clone(),
+    )
 }
 
 /// Remove from a card the skills the caller is not allowed to invoke.
@@ -189,15 +191,15 @@ pub async fn explorer_card(
 /// — using that context's own `caller_id`. Deriving the caller from `child()`
 /// instead of hardcoding `@external` keeps the agreement if apcore ever starts
 /// preserving a host-supplied top-level `caller_id`.
-pub(crate) fn acl_filtered_card(
+fn acl_filtered_card(
     card: &Value,
-    state: &AppState,
+    executor: &ApCoreAgentExecutor,
     identity: Option<&Identity>,
 ) -> Value {
-    let Some(acl) = state.executor.acl() else {
+    let Some(acl) = executor.acl() else {
         return card.clone();
     };
-    let base = state.executor.acl_context(identity.cloned());
+    let base = executor.acl_context(identity.cloned());
 
     let mut filtered = card.clone();
     if let Some(skills) = filtered.get_mut("skills").and_then(Value::as_array_mut) {
@@ -209,6 +211,70 @@ pub(crate) fn acl_filtered_card(
         });
     }
     filtered
+}
+
+/// How many per-caller filtered copies of one card are cached before the cache
+/// is dropped and rebuilt.
+const MAX_CACHED_FILTERED_CARDS: usize = 1024;
+
+/// An Agent Card together with its per-caller ACL-filtered copies.
+///
+/// The filter is memoized because `ACL::check` calls the consumer's audit sink
+/// — a synchronous `Fn(&AuditEntry)` that may write a file or a socket — once
+/// per skill. `/.well-known/agent-card.json` is auth-exempt, so filtering on
+/// every request let any anonymous client generate `skills.len()` governance
+/// audit entries per request at arbitrary rate, each recording `decision:
+/// "deny"` and indistinguishable from a real enforcement decision, while
+/// blocking a tokio worker for the duration of the sink.
+///
+/// Memoizing is sound because the ACL cannot change for the life of the
+/// process: it is installed on the `Executor` before `build_app` runs and is
+/// then reachable only through an `Arc<ACL>`, which has no interior
+/// mutability. The card itself is likewise built once.
+///
+/// The audit sink is still driven once per (caller, card) pair; nothing in
+/// apcore's public `ACL` API can suppress it (`default_effect` is private, so
+/// an audit-free twin cannot be reconstructed from `rules()`, and there is no
+/// `clear_audit_logger`). Bounding the cache bounds the exposure instead.
+pub struct FilteredCard {
+    card: Arc<Value>,
+    cache: Mutex<HashMap<String, Arc<Value>>>,
+}
+
+impl FilteredCard {
+    pub fn new(card: Arc<Value>) -> Self {
+        Self {
+            card,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The unfiltered card, as built at startup.
+    pub fn unfiltered(&self) -> &Arc<Value> {
+        &self.card
+    }
+
+    /// This card as `identity` may see it, computing and caching the filtered
+    /// copy on first request from that principal.
+    pub fn for_caller(
+        &self,
+        executor: &ApCoreAgentExecutor,
+        identity: Option<&Identity>,
+    ) -> Arc<Value> {
+        let key = owner_key(identity);
+        if let Some(cached) = self.cache.lock().unwrap().get(&key) {
+            return cached.clone();
+        }
+        let filtered = Arc::new(acl_filtered_card(&self.card, executor, identity));
+        let mut cache = self.cache.lock().unwrap();
+        // A flat cap rather than an eviction order: entries are equivalent and
+        // cheap to rebuild, so dropping the map is a fine way to stay bounded.
+        if cache.len() >= MAX_CACHED_FILTERED_CARDS {
+            cache.clear();
+        }
+        cache.insert(key, filtered.clone());
+        filtered
+    }
 }
 
 /// Extracts the authenticated apcore `Identity` from request extensions, if the
