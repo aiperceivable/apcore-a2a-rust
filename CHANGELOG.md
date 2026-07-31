@@ -21,6 +21,17 @@ Conformance and correctness fixes on the A2A server path, from
   carry their sanitized detail plus `ai_guidance` when apcore supplied one. An
   agent that reads a guard refusal can now correct itself. Python and TS emit
   the fixed string on this path too, so they need the same change.
+
+  `ai_guidance` is gated on exactly those three classes, not on
+  `err.user_fixable`. Six apcore codes carry `user_fixable = Some(true)` while
+  mapping to the fixed "Internal server error" (`VERSION_CONSTRAINT_INVALID`,
+  the three `BINDING_*` codes, `DEPENDENCY_NOT_FOUND`,
+  `DEPENDENCY_VERSION_MISMATCH`), and `user_fixable` is settable per-error by
+  the module author — so the first version of this change let a fixed,
+  deliberately-opaque string be extended with internal detail that
+  `sanitize_message` does not strip (module ids, versions, env-var names,
+  hostnames). A unit test now locks the gate to `ErrorMapper`'s own branching
+  across every apcore error code.
 - **`tasks/cancel` is guarded.** Unknown ids return `-32001` instead of
   fabricating a CANCELED task, terminal tasks return `-32002` instead of having
   their artifacts destroyed, and a cancelled task keeps the artifacts and

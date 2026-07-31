@@ -82,6 +82,31 @@ impl ErrorMapper {
     }
 }
 
+/// Whether [`ErrorMapper::to_jsonrpc_error`] lets this code's own message reach
+/// the caller (sanitized), or replaces it with a fixed per-class string.
+///
+/// This is the partition that decides whether a message may be *widened* — with
+/// `ai_guidance`, or anything else. It is deliberately not `user_fixable`, which
+/// is a different partition: six codes carry `user_fixable = Some(true)` while
+/// falling into `to_jsonrpc_error`'s catch-all (`VERSION_CONSTRAINT_INVALID`,
+/// the three `BINDING_*` codes, `DEPENDENCY_NOT_FOUND`,
+/// `DEPENDENCY_VERSION_MISMATCH`), and appending guidance to those extended the
+/// fixed "Internal server error" string with internal detail. `user_fixable` is
+/// also settable per-error by the module author, which would have let any module
+/// widen the fixed string at will.
+///
+/// `error_mapper_message_policy_matches_to_jsonrpc_error` locks this to the
+/// match in [`ErrorMapper::to_jsonrpc_error`] across every apcore error code, so
+/// the two cannot drift.
+pub(crate) fn carries_caller_detail(code: ApcoreErrorCode) -> bool {
+    matches!(
+        code,
+        ApcoreErrorCode::ModuleNotFound
+            | ApcoreErrorCode::SchemaValidationError
+            | ApcoreErrorCode::GeneralInvalidInput
+    )
+}
+
 /// Strip paths, tracebacks and excess whitespace from text bound for a caller.
 /// Crate-visible so the task-status surface (`server::handlers`) applies exactly
 /// the same redaction as the JSON-RPC surface.
@@ -240,5 +265,26 @@ mod tests {
     fn test_register_a2a_error_formatter_idempotent() {
         register_a2a_error_formatter();
         register_a2a_error_formatter();
+    }
+
+    #[test]
+    fn error_mapper_message_policy_matches_to_jsonrpc_error() {
+        // `carries_caller_detail` is what gates message widening (see
+        // `server::handlers::failure_text`), so it must name exactly the codes
+        // whose own message `to_jsonrpc_error` actually forwards. Asserted over
+        // every apcore error code with a sentinel that survives sanitization,
+        // so adding a code or an arm cannot silently desync the two.
+        const SENTINEL: &str = "canary-2f8a";
+        for &code in ApcoreErrorCode::ALL {
+            let mapped = ErrorMapper::to_jsonrpc_error(&make_error(code, SENTINEL));
+            assert_eq!(
+                mapped.message.contains(SENTINEL),
+                carries_caller_detail(code),
+                "{code:?}: to_jsonrpc_error forwards the message = {}, \
+                 carries_caller_detail = {}",
+                mapped.message.contains(SENTINEL),
+                carries_caller_detail(code),
+            );
+        }
     }
 }

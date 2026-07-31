@@ -28,7 +28,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::adapters::errors::{sanitize_message, ErrorMapper};
+use crate::adapters::errors::{carries_caller_detail, sanitize_message, ErrorMapper};
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::storage::TaskStore;
 use crate::types::{
@@ -236,14 +236,25 @@ fn error_to_status(err: &ModuleError) -> TaskStatus {
 ///   carry their sanitized detail, which srs FR-ERR-002 requires precisely so a
 ///   caller "can correct their input without guessing".
 ///
-/// For those caller-fixable classes the error's `ai_guidance` is appended when
+/// For those detail-carrying classes the error's `ai_guidance` is appended when
 /// apcore supplied one: it exists to tell an agent what to do next, and an A2A
 /// caller sees only this status message. It is withheld for every other class,
 /// where the message is a fixed per-class string that must stay fixed.
+///
+/// The gate is [`carries_caller_detail`] — the same partition [`ErrorMapper`]
+/// itself branches on. Gating on `err.user_fixable` instead was a different
+/// partition: six codes are `user_fixable = Some(true)` yet fall into
+/// `ErrorMapper`'s catch-all, so e.g. a `DEPENDENCY_NOT_FOUND` failure sent the
+/// caller `"Internal server error (module 'x' requires 'y' >= 2.1; …)"` — the
+/// deliberately-opaque string extended with dependency-graph detail that
+/// `sanitize_message` does not strip (it removes only paths and
+/// traceback-shaped lines, not module ids, versions, env-var names or
+/// hostnames). `user_fixable` is settable per-error by the module author, so
+/// any module could widen the fixed string further.
 fn failure_text(err: &ModuleError) -> String {
     let message = ErrorMapper::to_jsonrpc_error(err).message;
-    match (err.user_fixable, err.ai_guidance.as_deref()) {
-        (Some(true), Some(guidance)) if !guidance.trim().is_empty() => {
+    match err.ai_guidance.as_deref() {
+        Some(guidance) if carries_caller_detail(err.code) && !guidance.trim().is_empty() => {
             format!("{message} ({})", sanitize_message(guidance))
         }
         _ => message,
@@ -1120,11 +1131,43 @@ mod tests {
     fn ai_guidance_is_withheld_for_internal_errors() {
         // The fixed per-class strings must stay fixed: guidance on an internal
         // error would both widen the message and risk leaking internal detail.
-        let err = ModuleError::new(ErrorCode::GeneralInternalError, "boom")
-            .with_ai_guidance("inspect /var/log/secret.log");
+        //
+        // `DEPENDENCY_NOT_FOUND` is the case that actually discriminates.
+        // `user_fixable_for_code` marks it `Some(true)` while `ErrorMapper`
+        // maps it through the catch-all to "Internal server error", so the
+        // previous `user_fixable`-based gate appended the guidance verbatim —
+        // internal dependency-graph detail (module ids, versions, env-var
+        // names, hostnames), none of which `sanitize_message` strips.
+        let err = ModuleError::new(ErrorCode::DependencyNotFound, "boom").with_ai_guidance(
+            "module 'billing.charge' requires 'vault.secrets' >= 2.1; set VAULT_ADDR",
+        );
+        assert_eq!(err.user_fixable, Some(true), "precondition for this test");
         assert_eq!(
             status_text(&error_to_status(&err)).as_deref(),
             Some("Internal server error")
+        );
+
+        // And the original case, where the default `user_fixable` happened to
+        // agree, still holds.
+        let internal = ModuleError::new(ErrorCode::GeneralInternalError, "boom")
+            .with_ai_guidance("inspect /var/log/secret.log");
+        assert_eq!(
+            status_text(&error_to_status(&internal)).as_deref(),
+            Some("Internal server error")
+        );
+    }
+
+    #[test]
+    fn ai_guidance_is_withheld_when_a_module_declares_a_masked_error_user_fixable() {
+        // `user_fixable` is author-settable, so gating on it let any module
+        // widen a fixed per-class string. An ACL denial must stay exactly
+        // "Task not found" (srs FR-ERR-003) whatever the module claims.
+        let err = ModuleError::new(ErrorCode::ACLDenied, "caller alice denied admin.wipe")
+            .with_user_fixable(true)
+            .with_ai_guidance("ask an admin to grant you the 'admin.wipe' role");
+        assert_eq!(
+            status_text(&error_to_status(&err)).as_deref(),
+            Some("Task not found")
         );
     }
 
