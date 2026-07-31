@@ -70,6 +70,13 @@ Conformance and correctness fixes on the A2A server path, from
   UUIDv4 task id stood in the way. Cross-principal access is masked as `-32001`
   so task ids cannot be probed. The push-config methods now also require the
   task to exist, matching `a2a-python`'s `on_set/get_task_push_notification_config`.
+
+  The owner map is bounded (100 000 entries, oldest evicted first). Ownership
+  has to outlive a task's execution, so entries cannot be dropped on
+  completion the way `CancelGuard` drops a cancel token; without a cap the map
+  grew by one entry per submitted task for the process lifetime. Eviction is
+  fail-closed: an evicted task becomes unreachable to its owner rather than
+  reachable by anyone else.
   With no authenticator configured all callers share one owner, as upstream's
   `UnauthenticatedUser` does, so single-tenant deployments are unaffected.
 - **The Agent Card advertises only ACL-allowed skills, and the filter agrees

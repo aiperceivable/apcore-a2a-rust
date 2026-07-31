@@ -20,7 +20,7 @@ use crate::auth::protocol::Authenticator;
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::server::handlers::{
     acl_filtered_card, explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler,
-    AppState, AuthIdentity,
+    AppState, AuthIdentity, TaskOwners,
 };
 use crate::storage::TaskStore;
 
@@ -129,7 +129,7 @@ impl A2AServerFactory {
             explorer_card,
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
             push_configs: Arc::new(Mutex::new(HashMap::new())),
-            task_owners: Arc::new(Mutex::new(HashMap::new())),
+            task_owners: Arc::new(Mutex::new(TaskOwners::default())),
             http: reqwest::Client::new(),
         };
 

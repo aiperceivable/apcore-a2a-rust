@@ -53,10 +53,79 @@ pub struct AppState {
     /// Per-task push-notification webhook configs (`tasks/pushNotificationConfig/*`).
     pub push_configs: Arc<Mutex<HashMap<String, Value>>>,
     /// Owner (authenticated principal) of each task, keyed by task id. Scopes
-    /// `tasks/list` / `tasks/get` / `tasks/cancel` so one caller cannot read or
-    /// cancel another's tasks.
-    pub task_owners: Arc<Mutex<HashMap<String, String>>>,
+    /// every task-addressed method so one caller cannot read, cancel or
+    /// reconfigure another's tasks.
+    pub task_owners: Arc<Mutex<TaskOwners>>,
     pub http: reqwest::Client,
+}
+
+/// How many task→owner entries are retained before the oldest is evicted.
+///
+/// Sized so the map stays a few MB at worst while covering far more live tasks
+/// than a single process is expected to hold.
+const MAX_TRACKED_TASK_OWNERS: usize = 100_000;
+
+/// Bounded, insertion-ordered record of which principal owns which task.
+///
+/// This was a plain `HashMap` that only ever grew: one `(task_id, owner)` pair
+/// per submitted task, for the process lifetime, with no `remove` anywhere —
+/// the cancel-token map is unregistered on every exit path by `CancelGuard`,
+/// this had no equivalent, and a consumer bounding its own [`TaskStore`] via
+/// `TaskStore::delete` left the owner entry orphaned with no API to reach it.
+///
+/// Ownership has to outlive the task's execution (reading a completed task is
+/// the normal case), so entries cannot be dropped when a task reaches a
+/// terminal state. They are capped instead, and evicted oldest-first. Eviction
+/// is fail-closed exactly like any other unrecorded task: the evicted task
+/// becomes unreachable to its owner (`-32001`) rather than reachable by anyone
+/// else. A deployment holding more live tasks than the cap needs a `TaskStore`
+/// that carries the owner itself — see [`is_owned_by`].
+#[derive(Debug, Default)]
+pub struct TaskOwners {
+    by_task: HashMap<String, String>,
+    /// Task ids in insertion order, oldest first. Kept in lock-step with
+    /// `by_task`: exactly one entry per key, pushed only on first insert.
+    insertion_order: std::collections::VecDeque<String>,
+}
+
+impl TaskOwners {
+    /// Record `owner` as the owner of `task_id`, evicting the oldest entry when
+    /// the cap is reached. Re-recording a known task updates it in place.
+    fn insert(&mut self, task_id: &str, owner: &str) {
+        if let Some(existing) = self.by_task.get_mut(task_id) {
+            existing.clear();
+            existing.push_str(owner);
+            return;
+        }
+        while self.by_task.len() >= MAX_TRACKED_TASK_OWNERS {
+            match self.insertion_order.pop_front() {
+                Some(oldest) => {
+                    self.by_task.remove(&oldest);
+                }
+                // INVARIANT: `insertion_order` holds one entry per `by_task`
+                // key, so it cannot be empty while `by_task` is over the cap.
+                None => break,
+            }
+        }
+        self.by_task.insert(task_id.to_string(), owner.to_string());
+        self.insertion_order.push_back(task_id.to_string());
+    }
+
+    /// Whether `owner` is the recorded owner of `task_id`.
+    fn is_owned_by(&self, task_id: &str, owner: &str) -> bool {
+        self.by_task
+            .get(task_id)
+            .is_some_and(|task_owner| task_owner == owner)
+    }
+
+    /// The ids of every task recorded as belonging to `owner`.
+    fn tasks_of(&self, owner: &str) -> HashSet<String> {
+        self.by_task
+            .iter()
+            .filter(|(_, task_owner)| task_owner.as_str() == owner)
+            .map(|(task_id, _)| task_id.clone())
+            .collect()
+    }
 }
 
 /// Owner key for a request's authenticated principal.
@@ -815,14 +884,7 @@ async fn handle_get(state: &AppState, owner: &str, params: &Value) -> Result<Val
 /// (`a2a-python`'s `OwnerResolver`, `a2a-js`'s per-context bucket); the spec
 /// repo is silent on it, so this follows upstream.
 async fn handle_list(state: &AppState, owner: &str) -> Vec<Value> {
-    let owned: HashSet<String> = state
-        .task_owners
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(_, task_owner)| task_owner.as_str() == owner)
-        .map(|(task_id, _)| task_id.clone())
-        .collect();
+    let owned: HashSet<String> = state.task_owners.lock().unwrap().tasks_of(owner);
 
     state
         .task_store
@@ -1019,26 +1081,24 @@ fn notify_push(state: &AppState, task_id: &str, event: &StreamEvent) {
 
 /// Record which principal a task belongs to.
 fn register_owner(state: &AppState, task_id: &str, owner: &str) {
-    state
-        .task_owners
-        .lock()
-        .unwrap()
-        .insert(task_id.to_string(), owner.to_string());
+    state.task_owners.lock().unwrap().insert(task_id, owner);
 }
 
-/// Whether `owner` may read or cancel `task_id`.
+/// Whether `owner` may read, cancel or reconfigure `task_id`.
 ///
 /// Fails closed: a task with no recorded owner is visible to nobody. The
 /// ownership map lives in process memory, so a custom [`TaskStore`] that
 /// outlives the process would need to carry the owner itself — that is a
-/// `TaskStore` trait change and is deliberately not made here.
+/// `TaskStore` trait change and is deliberately not made here. Two consequences
+/// follow, both disclosed in the CHANGELOG: after a restart with a persistent
+/// store every persisted task is unreachable to its genuine owner, and a task
+/// evicted from [`TaskOwners`] under its cap becomes unreachable too.
 fn is_owned_by(state: &AppState, task_id: &str, owner: &str) -> bool {
     state
         .task_owners
         .lock()
         .unwrap()
-        .get(task_id)
-        .is_some_and(|task_owner| task_owner == owner)
+        .is_owned_by(task_id, owner)
 }
 
 fn register_cancel(state: &AppState, task_id: &str, token: CancelToken) {
@@ -1191,6 +1251,43 @@ mod tests {
             status_text(&error_to_status(&err)).as_deref(),
             Some("Task not found")
         );
+    }
+
+    #[test]
+    fn task_owners_stays_bounded_and_evicts_oldest_first() {
+        // The owner map had insert/get/iter and no remove anywhere, so it grew
+        // by one `(String, String)` per submitted task for the process
+        // lifetime. It is now capped, evicting oldest-first.
+        let mut owners = TaskOwners::default();
+        for i in 0..MAX_TRACKED_TASK_OWNERS + 10 {
+            owners.insert(&format!("task-{i}"), "u1");
+        }
+        assert_eq!(owners.by_task.len(), MAX_TRACKED_TASK_OWNERS);
+        assert_eq!(owners.insertion_order.len(), MAX_TRACKED_TASK_OWNERS);
+
+        // The 10 oldest are gone — fail-closed, not reassigned to anyone else.
+        assert!(!owners.is_owned_by("task-0", "u1"));
+        assert!(!owners.is_owned_by("task-9", "u1"));
+        assert!(!owners.is_owned_by("task-0", ""));
+        // The newest survive.
+        assert!(owners.is_owned_by("task-10", "u1"));
+        assert!(owners.is_owned_by(&format!("task-{}", MAX_TRACKED_TASK_OWNERS + 9), "u1"));
+    }
+
+    #[test]
+    fn task_owners_reinsert_updates_in_place_without_growing_the_queue() {
+        // `register_owner` runs on more than one path per task; a repeat must
+        // not push a second `insertion_order` entry (which would let the map
+        // and the queue drift and evict a live task early).
+        let mut owners = TaskOwners::default();
+        owners.insert("t1", "u1");
+        owners.insert("t1", "u2");
+        assert_eq!(owners.by_task.len(), 1);
+        assert_eq!(owners.insertion_order.len(), 1);
+        assert!(owners.is_owned_by("t1", "u2"));
+        assert!(!owners.is_owned_by("t1", "u1"));
+        assert_eq!(owners.tasks_of("u2"), HashSet::from(["t1".to_string()]));
+        assert!(owners.tasks_of("u1").is_empty());
     }
 
     #[test]
