@@ -84,6 +84,27 @@ Conformance and correctness fixes on the A2A server path, from
 
 ### Changed
 
+- **Requires apcore 0.27 (`>=0.27, <0.28`).** The floor was an unbounded
+  `>=0.26`, so cargo was free to resolve a future major-breaking apcore into
+  this crate. One 0.27 breaking change reaches the Agent Card:
+  `Registry::describe` returns `Result<String, ModuleError>` instead of
+  `String`, and its `Ok` value is now the cross-SDK Markdown *document* (an
+  `# {module_id}` heading, `**Tags:**`, a `**Parameters:**` list,
+  `**Documentation:**`) where through 0.26 it was the module's one-line
+  `description()`. `AgentCardBuilder::build` fed that value straight into every
+  `AgentSkill.description`, so on 0.27 the whole document would have been
+  published on the card. It now reads `ModuleDescriptor::description`, which is
+  the field `apcore-a2a-python`'s builder has always used
+  (`agent_card.py:147`) and is the same string 0.26's `describe()` returned —
+  so the card is byte-identical across the bump. Pinned by
+  `skill_description_is_the_one_line_description_not_the_describe_document`,
+  which asserts against the live `describe()` output so it cannot pass
+  vacuously.
+
+  No other 0.27 breaking change applies: this crate names none of
+  `ErrorCode::ConfigurationError`, `RedactionConfig`, `with_coerce_types`,
+  `_config.strict`, `pipeline.configure`, `inject_checked` or `StepMiddleware`,
+  registers no step middleware, and asserts on no redacted output.
 - **Source-breaking changes to the `server::handlers` surface.** The documented
   entry points (`build_app`, `build_app_with_auth`, `serve`, `async_serve`,
   `APCoreA2AConfig`, `BackendSource`) are unchanged; only code that constructs

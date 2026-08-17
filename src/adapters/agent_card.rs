@@ -138,7 +138,18 @@ impl AgentCardBuilder {
             .filter_map(|module_id| {
                 // apcore 0.22: get_definition returns Result<Option<…>>.
                 let def = registry.get_definition(module_id).ok().flatten()?;
-                let desc = registry.describe(module_id);
+                // The skill description is the descriptor's own one-line
+                // `description`, which is what `apcore-a2a-python`'s
+                // `AgentCardBuilder` reads (`agent_card.py:147`).
+                //
+                // NOT `Registry::describe`: since apcore 0.27 that returns the
+                // cross-SDK Markdown *document* — an `# {module_id}` heading,
+                // `**Tags:**`, a `**Parameters:**` list and `**Documentation:**`
+                // — which would land whole in every `AgentSkill.description` on
+                // the Agent Card. Through apcore 0.26 it returned
+                // `module.description()`, i.e. exactly this field, so reading
+                // the descriptor keeps the card identical across the bump.
+                let desc = def.description.clone();
                 // Skip modules without a description (Python/TS `to_skill` → None,
                 // and the spec excludes them from the Agent Card).
                 if desc.trim().is_empty() {
@@ -305,6 +316,44 @@ mod tests {
             capabilities(),
             None,
         )
+    }
+
+    #[test]
+    fn skill_description_is_the_one_line_description_not_the_describe_document() {
+        // Regression (apcore 0.27): `Registry::describe` changed from returning
+        // `module.description()` to returning the cross-SDK Markdown document
+        // (`# {module_id}` heading, `**Tags:**`, `**Parameters:**`,
+        // `**Documentation:**`). The card must carry the one-line description
+        // `apcore-a2a-python` puts there (`agent_card.py:147` reads
+        // `descriptor.description`), not that whole document.
+        let registry = echo_registry();
+        let builder = AgentCardBuilder::new(SkillMapper::new());
+
+        let card = build_card(&builder, &registry);
+        let skill = card
+            .skills
+            .iter()
+            .find(|s| s.id == "test.echo")
+            .expect("echo skill is advertised");
+
+        assert_eq!(skill.description, "Echoes its inputs");
+
+        // Anchor on the runtime value: if a future apcore makes `describe()`
+        // return the bare line again, this stops being a real guard and the
+        // assertion below says so rather than passing vacuously.
+        let document = registry
+            .describe("test.echo")
+            .expect("module is registered");
+        assert_ne!(
+            document, skill.description,
+            "Registry::describe no longer differs from the one-line description \
+             — re-check which of the two the Agent Card should carry"
+        );
+        assert!(
+            !skill.description.contains("# test.echo"),
+            "the describe() document leaked into the skill description: {}",
+            skill.description
+        );
     }
 
     #[test]
