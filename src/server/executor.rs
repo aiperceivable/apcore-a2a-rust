@@ -56,8 +56,8 @@ impl ApCoreAgentExecutor {
         self.executor.acl.clone()
     }
 
-    /// Build an apcore `Context` carrying the caller principal, the cancel
-    /// token and a global deadline (`now + execution_timeout`, fractional
+    /// Build an apcore `Context` carrying the authenticated identity, the
+    /// cancel token and a global deadline (`now + execution_timeout`, fractional
     /// seconds since UNIX epoch per the apcore Rust contract).
     ///
     /// `caller_id` is deliberately left unset. It is **not** the authenticated
