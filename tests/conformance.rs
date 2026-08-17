@@ -213,6 +213,63 @@ async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Coverage guard
+// ---------------------------------------------------------------------------
+
+/// Every fixture in the spec repo that this file claims to drive.
+const DRIVEN_FIXTURES: &[&str] = &[
+    "agent_card.json",
+    "error_mapping.json",
+    "jwt_claim_coercion.json",
+    "part_conversion.json",
+    "skill_resolution.json",
+    "streaming_events.json",
+];
+
+#[test]
+fn every_spec_fixture_has_a_driver() {
+    // The drivers below iterate every case in the fixture they load, so a case
+    // ADDED upstream is picked up automatically. A whole new fixture FILE is
+    // not: nothing loads it, every test stays green, and the SDK is unpinned
+    // against a contract the spec now states. This is the per-SDK question
+    // apcore#92 asks — does *this* SDK run the case — applied to files.
+    //
+    // Adding a name here without writing the driver defeats the guard.
+    let dir = spec_root().join("conformance/fixtures");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("spec repo not present, skipping: {}", dir.display());
+        return;
+    };
+
+    let mut undriven: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".json"))
+        .filter(|n| !DRIVEN_FIXTURES.contains(&n.as_str()))
+        .collect();
+    undriven.sort();
+
+    assert!(
+        undriven.is_empty(),
+        "{} spec fixture(s) have no driver in tests/conformance.rs: {undriven:?} \
+         — write the driver, then add the file name to DRIVEN_FIXTURES",
+        undriven.len()
+    );
+
+    // Fail the other way too: a name listed here whose file is gone means the
+    // matching driver is silently returning early on every run.
+    let missing: Vec<&&str> = DRIVEN_FIXTURES
+        .iter()
+        .filter(|n| !dir.join(n).is_file())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "DRIVEN_FIXTURES names fixture(s) the spec repo no longer has: {missing:?} \
+         — the driver for each is skipping every case"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // A-ERR: error mapping
 // ---------------------------------------------------------------------------
 
