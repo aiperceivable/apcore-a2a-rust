@@ -172,19 +172,27 @@ Conformance and correctness fixes on the A2A server path, from
   inert on the card path (apcore's `check_conditions` returns false without a
   context) while it stayed live on the call path.
 
-  **Known limitation (apcore 0.26): an ACL `callers:` entry other than
-  `@external` can never match an inbound A2A request.** The standard pipeline
-  runs `BuiltinCallChainGuard` before `BuiltinACLCheck`, and that step replaces
-  the context with `Context::child(module_id)`, which re-derives `caller_id`
-  from `call_chain.last()` — empty on a top-level call. A host cannot set the
-  caller from outside apcore; `Context::child` would have to preserve an
-  explicitly-set top-level `caller_id`. The same limitation makes the audit
-  trail's caller dimension, the circuit breaker's per-caller key and the
-  obs/otel caller attribute permanently anonymous. Until apcore changes,
-  discriminate callers with an `identity_types` / `roles` condition, which is
-  evaluated against the identity and does reach the ACL. The adapter now passes
-  the authenticated identity as `caller_id` on the context it builds, so both
-  surfaces pick up the real principal the moment apcore preserves it.
+  **Writing caller rules: `callers:` names the calling module, not the
+  principal.** An inbound A2A request is a top-level call, so it reaches
+  `BuiltinACLCheck` with `caller_id = None` and `ACL::check` evaluates it as
+  `@external` — on the card path and the call path alike. That is apcore's
+  contract, not a gap in it: `caller_id` is the calling module in a nested call
+  chain, managed exclusively by `Context::child` (apcore `Context::create`
+  doc — "top-level Contexts always have `caller_id = None`"). It is also the
+  behaviour operators depend on, since `callers: ["@external"] … deny` is the
+  natural way to lock external traffic out, and it has to keep matching an
+  authenticated request or it silently stops covering what it was written for.
+
+  The designed way to discriminate principals is `@system` (matched against
+  `identity.identity_type`) or an `identity_types` / `roles` condition. Both
+  read `ctx.identity`, which `Context::child` clones through unchanged and
+  `BuiltinACLCheck` passes to `ACL::check`, so both work today on both
+  surfaces. A rule naming a principal in `callers:` — `callers: ["u1"]` — will
+  never match, and the card is careful not to pretend otherwise.
+
+  One real consequence remains: the audit trail's caller dimension, the circuit
+  breaker's per-caller key and the obs/otel caller attribute read `caller_id`
+  rather than `identity`, so they record `@external` for every inbound request.
 
   The filtered card is memoized per caller. `ACL::check` invokes the consumer's
   audit sink — a synchronous `Fn(&AuditEntry)` — once per skill, and the

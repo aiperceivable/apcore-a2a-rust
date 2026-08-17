@@ -190,10 +190,18 @@ pub async fn explorer_card(
 /// The two surfaces now agree by construction: each skill is checked exactly as
 /// the pipeline checks it — against
 /// `ApCoreAgentExecutor::acl_context(identity).child(skill_id)`, which is what
-/// `BuiltinContextCreation` + `BuiltinCallChainGuard` hand to `BuiltinACLCheck`
-/// — using that context's own `caller_id`. Deriving the caller from `child()`
-/// instead of hardcoding `@external` keeps the agreement if apcore ever starts
-/// preserving a host-supplied top-level `caller_id`.
+/// `BuiltinContextCreation` hands to `BuiltinACLCheck` — using that context's
+/// own `caller_id`. Deriving the caller from `child()` rather than hardcoding
+/// `@external` is what makes the agreement structural: it is the same one line
+/// of apcore, so the two cannot drift apart under a pipeline change.
+///
+/// `caller_id` is `None` here for every inbound request, authenticated or not,
+/// and `ACL::check` maps that to `@external`. That is apcore's contract, not a
+/// gap: `caller_id` names the *calling module* in a nested call chain and is
+/// managed exclusively by `Context::child`. The authenticated principal is
+/// carried in `identity` and reaches the ACL through the context passed here,
+/// so `@system` and the `identity_types` / `roles` conditions discriminate
+/// callers on both surfaces.
 fn acl_filtered_card(
     card: &Value,
     executor: &ApCoreAgentExecutor,

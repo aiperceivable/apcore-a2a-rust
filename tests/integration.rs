@@ -994,11 +994,12 @@ async fn is_callable(router: axum::Router, bearer: &str, skill_id: &str) -> bool
 async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
     // The card filter evaluated the authenticated principal while the call
     // path evaluated `@external` (see `ApCoreAgentExecutor::build_context`:
-    // apcore's `BuiltinCallChainGuard` re-derives `caller_id` from an empty
-    // `call_chain` before `BuiltinACLCheck` runs, so no host can name the
-    // caller). It also passed `ctx: None`, which makes apcore's
-    // `check_conditions` return false unconditionally — so a rule carrying a
-    // `conditions:` block was inert on the card path and live on the call path.
+    // apcore's `Context::child` derives `caller_id` from an empty `call_chain`
+    // before `BuiltinACLCheck` runs, because `caller_id` names the calling
+    // MODULE, not the principal). It also passed `ctx: None`, which makes
+    // apcore's `check_conditions` return false unconditionally — so a rule
+    // carrying a `conditions:` block was inert on the card path and live on
+    // the call path.
     //
     // Under the ACL below that produced both failure directions at once: `u1`
     // was advertised `test.internal` (rule 2, which the enforcement path can
@@ -1029,12 +1030,13 @@ async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
                 "deny",
                 None,
             ),
-            // 2. A rule naming a principal by id. apcore never delivers a
-            //    caller id other than `@external` to a top-level call, so this
-            //    rule is inert — and the card must not pretend otherwise.
+            // 2. A rule naming a principal by id. `callers:` matches the
+            //    calling module, and a top-level call has none, so this rule
+            //    is inert by design — and the card must not pretend otherwise.
             rule(&["u1"], &["test.internal"], "allow", None),
-            // 3. What actually discriminates callers today: a condition on the
-            //    identity, which does survive into the ACL check.
+            // 3. The designed way to discriminate callers: a condition on the
+            //    identity, which `Context::child` clones through and
+            //    `BuiltinACLCheck` hands to `ACL::check`.
             rule(
                 &["*"],
                 &["*"],
