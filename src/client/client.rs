@@ -155,6 +155,9 @@ impl A2AClient {
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim_start();
                         if let Ok(frame) = serde_json::from_str::<Value>(data) {
+                            if let Some(err) = stream_frame_error(&frame) {
+                                Err(err)?;
+                            }
                             let event = unwrap_stream_envelope(frame);
                             let terminal = is_terminal_event(&event);
                             yield event;
@@ -182,13 +185,23 @@ impl A2AClient {
             .map_err(|e| attach_task_id(e, task_id))
     }
 
-    /// List tasks via `tasks/list`.
+    /// List tasks via `ListTasks`.
+    ///
+    /// A2A 1.0 names this method `ListTasks`; 0.3 had no task-listing method at
+    /// all. `tasks/list` — used here until 0.5.0 — was neither, so it reached
+    /// only this project's own Rust server.
+    ///
+    /// `limit` is kept as the friendly parameter name but goes on the wire as
+    /// `pageSize`, which is what `ListTasksRequest` actually declares (alongside
+    /// `pageToken`, `status`, `historyLength`, …). Sending `limit` earned an
+    /// `-32602` from both SDK-backed servers.
     pub async fn list_tasks(&self, context_id: Option<String>, limit: i64) -> ClientResult<Value> {
-        let mut params = json!({ "limit": limit });
+        let mut params = json!({ "pageSize": limit });
         if let Some(cid) = context_id {
             params["contextId"] = Value::String(cid);
         }
-        self.jsonrpc_call("tasks/list", params).await
+        self.jsonrpc_call_versioned("ListTasks", params, Some("1.0"))
+            .await
     }
 
     /// Close the client (releases the underlying HTTP connection pool).
@@ -199,6 +212,21 @@ impl A2AClient {
 
     /// POST a JSON-RPC request, returning the `result` or a typed error.
     async fn jsonrpc_call(&self, method: &str, params: Value) -> ClientResult<Value> {
+        self.jsonrpc_call_versioned(method, params, None).await
+    }
+
+    /// Send a JSON-RPC request, optionally declaring the A2A protocol version.
+    ///
+    /// Both upstream SDKs treat a request with no `A2A-Version` header as v0.3
+    /// (spec section 3.6.2), and refuse 1.0 method names in that mode with
+    /// `-32009`. Methods that only exist in 1.0 must therefore declare `"1.0"`;
+    /// the ones 0.3 also has are left unversioned so 0.3 servers keep working.
+    async fn jsonrpc_call_versioned(
+        &self,
+        method: &str,
+        params: Value,
+        a2a_version: Option<&str>,
+    ) -> ClientResult<Value> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": Uuid::new_v4().to_string(),
@@ -207,10 +235,11 @@ impl A2AClient {
         });
         let url = format!("{}/", self.base_url);
 
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
+        let mut request = self.http.post(&url).json(&body);
+        if let Some(version) = a2a_version {
+            request = request.header("A2A-Version", version);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| A2AClientError::Connection(e.to_string()))?;
@@ -262,6 +291,26 @@ fn build_message_params(
 ///
 /// Frames without an envelope are passed through unchanged, so the client still
 /// reads a server that emits bare payloads.
+/// The client error a JSON-RPC error frame on the stream represents.
+///
+/// A mid-stream failure arrives as its own frame — upstream tags it
+/// `event: error` and puts a JSON-RPC error response in `data:`. Envelope
+/// unwrapping only looks for `result`, so without this the frame was yielded as
+/// though it were an event and the failure was lost, while the non-streaming
+/// path raised for byte-identical payload. Same `from_jsonrpc` mapping as there,
+/// so a caller gets `TaskNotFound` / `TaskNotCancelable` on both paths.
+fn stream_frame_error(frame: &Value) -> Option<A2AClientError> {
+    frame.get("jsonrpc")?;
+    let err = frame.get("error")?;
+    let code = err.get("code").and_then(Value::as_i64).unwrap_or(-32603) as i32;
+    let message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Some(A2AClientError::from_jsonrpc(code, message))
+}
+
 fn unwrap_stream_envelope(frame: Value) -> Value {
     match (frame.get("jsonrpc"), frame.get("result")) {
         (Some(_), Some(result)) => result.clone(),
@@ -305,6 +354,37 @@ fn validate_url(url: &str) -> ClientResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_error_frame_maps_to_the_same_error_as_a_unary_call() {
+        // Upstream reports a mid-stream failure as its own frame (tagged
+        // `event: error`). Envelope unwrapping only looks for `result`, so
+        // without this check the frame was yielded as though it were an event
+        // and the failure was lost — while the unary path errored on the same
+        // payload. Both go through `from_jsonrpc`, so the variant matches.
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "req-1",
+            "error": { "code": -32001, "message": "Task not found" }
+        });
+        assert!(matches!(
+            stream_frame_error(&frame),
+            Some(A2AClientError::TaskNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn stream_error_frame_ignores_ordinary_events() {
+        // A normal event carries `result`, never `error`.
+        let event = json!({
+            "jsonrpc": "2.0",
+            "id": "req-1",
+            "result": { "statusUpdate": { "status": { "state": "TASK_STATE_WORKING" } } }
+        });
+        assert!(stream_frame_error(&event).is_none());
+        // And a bare event with no envelope at all is not an error either.
+        assert!(stream_frame_error(&json!({ "statusUpdate": {} })).is_none());
+    }
 
     #[test]
     fn validate_url_accepts_http_and_https() {

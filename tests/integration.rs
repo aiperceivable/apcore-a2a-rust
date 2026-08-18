@@ -344,13 +344,13 @@ async fn send_to(router: axum::Router, skill_id: &str) -> Value {
     resp
 }
 
-/// Poll `tasks/list` until the task a concurrent `message/send` persisted as
+/// Poll `ListTasks` until the task a concurrent `message/send` persisted as
 /// SUBMITTED appears, and return its (server-generated) id.
 async fn await_in_flight_task_id(router: axum::Router) -> String {
     for _ in 0..100 {
         let (_status, listed) = post_rpc(
             router.clone(),
-            json!({ "jsonrpc": "2.0", "id": "list", "method": "tasks/list", "params": {} }),
+            json!({ "jsonrpc": "2.0", "id": "list", "method": "ListTasks", "params": {} }),
         )
         .await;
         if let Some(id) = listed["result"]["tasks"][0]["id"].as_str() {
@@ -771,7 +771,7 @@ async fn notification_is_answered_with_a_null_id() {
     // follows the transport authority rather than diverging alone.
     let (status, resp) = post_rpc(
         build().await,
-        json!({ "jsonrpc": "2.0", "method": "tasks/list", "params": {} }),
+        json!({ "jsonrpc": "2.0", "method": "ListTasks", "params": {} }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -839,7 +839,7 @@ async fn auth_rejects_unauthenticated_jsonrpc() {
         .uri("/")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({"jsonrpc":"2.0","id":"1","method":"tasks/list","params":{}}).to_string(),
+            json!({"jsonrpc":"2.0","id":"1","method":"ListTasks","params":{}}).to_string(),
         ))
         .unwrap();
     let resp = build_with_auth().await.oneshot(req).await.unwrap();
@@ -855,7 +855,7 @@ async fn auth_allows_valid_bearer_and_card_stays_public() {
         .header("content-type", "application/json")
         .header("authorization", "Bearer good")
         .body(Body::from(
-            json!({"jsonrpc":"2.0","id":"1","method":"tasks/list","params":{}}).to_string(),
+            json!({"jsonrpc":"2.0","id":"1","method":"ListTasks","params":{}}).to_string(),
         ))
         .unwrap();
     let resp = build_with_auth().await.oneshot(req).await.unwrap();
@@ -889,7 +889,7 @@ async fn post_rpc_as(router: axum::Router, bearer: &str, body: Value) -> Value {
 
 #[tokio::test]
 async fn task_reads_are_scoped_to_the_authenticated_principal() {
-    // `tasks/list` returned every caller's tasks, including the full stdout of
+    // `ListTasks` returned every caller's tasks, including the full stdout of
     // tasks other callers submitted, and `tasks/get` / `tasks/cancel` accepted
     // another principal's task id.
     let app = build_with_auth().await;
@@ -912,7 +912,7 @@ async fn task_reads_are_scoped_to_the_authenticated_principal() {
     let mine = post_rpc_as(
         app.clone(),
         "good",
-        json!({ "jsonrpc": "2.0", "id": "2", "method": "tasks/list", "params": {} }),
+        json!({ "jsonrpc": "2.0", "id": "2", "method": "ListTasks", "params": {} }),
     )
     .await;
     assert_eq!(mine["result"]["tasks"].as_array().map(Vec::len), Some(1));
@@ -921,7 +921,7 @@ async fn task_reads_are_scoped_to_the_authenticated_principal() {
     let theirs = post_rpc_as(
         app.clone(),
         "other",
-        json!({ "jsonrpc": "2.0", "id": "3", "method": "tasks/list", "params": {} }),
+        json!({ "jsonrpc": "2.0", "id": "3", "method": "ListTasks", "params": {} }),
     )
     .await;
     assert_eq!(
@@ -1541,7 +1541,7 @@ async fn a_persistent_store_keeps_task_isolation_across_a_restart() {
     // consumer-supplied persistent store came back from a restart holding
     // tasks that no longer had a recorded owner — and `is_owned_by` fails
     // closed, which made every one of them permanently unreachable to its
-    // genuine owner (`tasks/get` -32001, `tasks/list` []). Owner now lives in
+    // genuine owner (`tasks/get` -32001, `ListTasks` []). Owner now lives in
     // the store, so a restart preserves both halves: the owner still reaches
     // its tasks, and nobody else does.
     let tasks: Arc<dyn apcore_a2a::TaskStore> = Arc::new(apcore_a2a::InMemoryTaskStore::new());
@@ -1568,7 +1568,7 @@ async fn a_persistent_store_keeps_task_isolation_across_a_restart() {
     let owner_list = post_rpc_as(
         restarted().await,
         "good",
-        json!({"jsonrpc": "2.0", "id": 3, "method": "tasks/list", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "ListTasks", "params": {}}),
     )
     .await;
     let listed: Vec<&str> = owner_list["result"]["tasks"]
@@ -1591,7 +1591,7 @@ async fn a_persistent_store_keeps_task_isolation_across_a_restart() {
     let other_list = post_rpc_as(
         restarted().await,
         "other",
-        json!({"jsonrpc": "2.0", "id": 5, "method": "tasks/list", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 5, "method": "ListTasks", "params": {}}),
     )
     .await;
     assert_eq!(other_list["result"]["tasks"].as_array().unwrap().len(), 0);

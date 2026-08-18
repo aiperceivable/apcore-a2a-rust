@@ -3,7 +3,7 @@
 //! A single `POST /` endpoint dispatches the A2A JSON-RPC methods. `message/send`
 //! runs a task to completion and returns the final `Task`; `message/stream`
 //! returns an SSE stream of A2A 1.0 events (`statusUpdate` / `artifactUpdate`);
-//! `tasks/get` / `tasks/cancel` / `tasks/list` manage task state. Per-task
+//! `tasks/get` / `tasks/cancel` / `ListTasks` manage task state. Per-task
 //! `CancelToken`s back `tasks/cancel` (cooperative apcore cancellation).
 
 use std::collections::{HashMap, HashSet};
@@ -439,7 +439,7 @@ pub async fn jsonrpc_handler(
             Ok(task) => Json(rpc_result(&id, task)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "tasks/list" => match handle_list(&state, &ctx).await {
+        "ListTasks" => match handle_list(&state, &ctx).await {
             Ok(tasks) => Json(rpc_result(&id, json!({ "tasks": tasks }))).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
@@ -681,7 +681,11 @@ async fn handle_send(
         }
     }
     let task_json = serde_json::to_value(&task).unwrap();
-    save_task(state, &task_id, task_json.clone(), ctx).await;
+    state
+        .task_store
+        .save(&task_id, task_json.clone(), ctx)
+        .await
+        .map_err(|e| store_failure(&format!("task store write for {task_id}"), e))?;
 
     // Deliver the terminal status to any registered webhook.
     notify_push(
@@ -892,7 +896,11 @@ async fn handle_get(
     }
 }
 
-/// `tasks/list` — return the calling principal's tasks.
+/// `ListTasks` — return the calling principal's tasks.
+///
+/// Named `ListTasks` because that is what A2A 1.0 calls it; 0.3 had no
+/// task-listing method. The `tasks/list` spelling this used until 0.5.0 was
+/// neither, so no upstream SDK ever routed it.
 ///
 /// Unscoped, this returned every caller's tasks including the full stdout of
 /// tasks other callers submitted. The upstream A2A stores scope by owner

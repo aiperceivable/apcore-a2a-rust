@@ -4,7 +4,7 @@
 //! nothing exercised what the server reports when a consumer-supplied store is
 //! unreachable. Two failures hid there: `pushNotificationConfig/delete`
 //! answered `result: null` while the config was still live and still receiving
-//! deliveries, and `tasks/list` answered `[]`, which reads as "you have no
+//! deliveries, and `ListTasks` answered `[]`, which reads as "you have no
 //! tasks" rather than "the database is down".
 //!
 //! The rule these tests pin down: a backend failure is `-32603`, never
@@ -297,7 +297,7 @@ async fn tasks_list_reports_a_store_outage_instead_of_an_empty_list() {
 
     let resp = post(
         h.router.clone(),
-        json!({"jsonrpc": "2.0", "id": 1, "method": "tasks/list", "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 1, "method": "ListTasks", "params": {}}),
     )
     .await;
     assert!(
@@ -437,7 +437,7 @@ async fn in_flight_task_id(h: &Harness) -> String {
     for _ in 0..100 {
         let listed = post(
             h.router.clone(),
-            json!({ "jsonrpc": "2.0", "id": "list", "method": "tasks/list", "params": {} }),
+            json!({ "jsonrpc": "2.0", "id": "list", "method": "ListTasks", "params": {} }),
         )
         .await;
         if let Some(id) = listed["result"]["tasks"][0]["id"].as_str() {

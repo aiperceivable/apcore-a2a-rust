@@ -114,6 +114,16 @@ to 0.27. Deployments on the default in-memory stores and on `build_app` /
   missing, with nothing logged in between. The response is unchanged — the work
   really did run — but the failure now reaches the operator.
 
+- **A JSON-RPC error frame on an SSE stream now raises instead of being yielded
+  as an event.** Upstream reports a mid-stream failure as its own frame, tagged
+  `event: error` with a JSON-RPC error response in `data:`. Envelope unwrapping
+  only looks for `result`, so such a frame fell through and was handed to the
+  caller as though it were an event — a caller reading `statusUpdate` saw
+  nothing and the failure vanished, while the non-streaming path raised for a
+  byte-identical payload. Both paths now share the same error mapping, so a
+  `-32001` frame produces `TaskNotFoundError` wherever it arrives. Events
+  received before the error frame are still delivered.
+
 ### Changed (BREAKING)
 
 - **`TaskStore` carries the owner; `PushConfigStore` is new.** Every
@@ -156,6 +166,34 @@ to 0.27. Deployments on the default in-memory stores and on `build_app` /
   `AppState`s and `create` signatures; both surfaces are now closed, so adding
   a component later is not a breaking change. `CreateOptions` is also the only
   way to supply a custom store.
+
+- **The `tasks/list` method is gone; task listing is `ListTasks` (BREAKING).**
+  `tasks/list` was not an A2A method name in any version — 1.0 calls it
+  `ListTasks`, and 0.3 had no task-listing method at all, which is why its v0.3
+  compatibility layer routes `message/send` / `tasks/get` / `tasks/cancel` but
+  not this one. This project invented the name, wrote it into the spec, and
+  implemented it only in the Rust server, so the result was broken in both
+  directions: the bundled clients' `list_tasks()` returned `-32601` against the
+  Python and TypeScript servers, and a third-party 1.0 client's `ListTasks`
+  returned `-32601` against the Rust one. Only Rust-server-plus-bundled-client
+  worked.
+
+  `A2AClient::list_tasks` now sends `ListTasks` with an `A2A-Version: 1.0`
+  header — required, since both upstream SDKs read a request without it as v0.3
+  (spec 3.6.2) and reject 1.0 method names with `-32009`. The other methods keep
+  their 0.3 spellings, which every SDK still accepts.
+
+  The parameter names were wrong too, which only an end-to-end call could
+  surface: `ListTasksRequest` declares `pageSize` / `pageToken` / `contextId` /
+  `status` / `historyLength`, and has no `limit` field at all — so even with the
+  method name fixed, both SDK-backed servers answered `-32602 Invalid params`.
+  The Rust server had never caught it because it ignores list parameters
+  entirely. `list_tasks(limit=…)` keeps `limit` as the friendly parameter name
+  and sends `pageSize` on the wire.
+
+  **Migration:** callers sending `tasks/list` on the wire must send `ListTasks`
+  plus the version header. Users of `A2AClient::list_tasks` need no change. This
+  affects Rust deployments only; the method never worked on the other two.
 
 ### Added
 
