@@ -30,7 +30,7 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 - **SSE streaming** — `message/stream` server-sent events; `A2AClient::stream_message` on the client
 - **Push notifications** — `tasks/pushNotificationConfig/{set,get,delete}` with webhook delivery
 - **CLI support** — `apcore-a2a --extensions-dir ./extensions` for zero-code startup
-- **Pluggable storage** — `TaskStore` trait for custom backends
+- **Pluggable storage** — `TaskStore` / `PushConfigStore` traits for custom backends, owner-scoped per call
 - **Observability** — `/health` endpoint
 - **Config Bus** — registers `apcore-a2a` namespace with `APCORE_A2A` env prefix (apcore 0.22)
 - **Error Formatter Registry** — registers A2A error formatter with apcore ecosystem (§8.8)
@@ -132,7 +132,7 @@ src/
   auth/        JWTAuthenticator, AuthMiddleware, Authenticator trait
   server/      A2AServerFactory, ApCoreAgentExecutor
   client/      A2AClient, AgentCardFetcher
-  storage/     TaskStore trait, InMemoryTaskStore
+  storage/     TaskStore + PushConfigStore traits, in-memory implementations, CallContext
   explorer/    Explorer UI HTML + card handler
   apcore_a2a.rs  APCoreA2A builder, serve(), async_serve()
   cli.rs       CLI entrypoint

@@ -34,7 +34,13 @@ pub use crate::auth::protocol::Authenticator;
 
 // Re-exports: server
 pub use crate::server::executor::ApCoreAgentExecutor;
-pub use crate::server::factory::A2AServerFactory;
+pub use crate::server::factory::{A2AServerFactory, CreateOptions};
+
+// Re-exports: storage
+pub use crate::storage::{
+    CallContext, InMemoryPushConfigStore, InMemoryTaskStore, ListParams, OwnerId, PushConfigStore,
+    StoreError, TaskStore,
+};
 
 // Re-exports: adapters
 pub use crate::adapters::{

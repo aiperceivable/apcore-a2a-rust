@@ -5,10 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-17
 
-Conformance and correctness fixes on the A2A server path, from
-`aiperceivable/apexe` issues #33, #34 and #35.
+Minor release. Task isolation moves into the `TaskStore`, which makes it survive
+a restart — a **breaking** change to the store traits and to
+`A2AServerFactory::create`; see *Changed (BREAKING)* below for the migration
+table. Also carries conformance and correctness fixes on the A2A server path
+from `aiperceivable/apexe` issues #33, #34 and #35, and raises the apcore floor
+to 0.27. Deployments on the default in-memory stores and on `build_app` /
+`serve` need no migration. 161 tests pass.
 
 ### Fixed
 
@@ -81,6 +86,83 @@ Conformance and correctness fixes on the A2A server path, from
   claiming the parameter was missing.
 - **`VERSION` tracks the crate version** (`CARGO_PKG_VERSION`) rather than a
   hand-maintained literal that had drifted to `0.4.1`.
+- **A store-backend failure is reported as `-32603`, never as `-32001`.** The
+  two demand opposite responses — an A2A agent reading *task not found*
+  re-submits work that is actually still there, while *internal error* is
+  correctly not caller-fixable — so they must stay distinguishable. This is the
+  same classification the task-status surface uses (srs FR-ERR-004 /
+  FR-ERR-008), now applied to every store-addressed method: `tasks/get`,
+  `tasks/cancel`, `tasks/list`, and all three `tasks/pushNotificationConfig/*`.
+
+  Three of those previously answered as though nothing was wrong:
+  `tasks/pushNotificationConfig/delete` returned `result: null` while the
+  config stayed live and kept delivering — a caller revoking a leaked webhook
+  was told it had worked; `tasks/list` returned `[]`, which reads as "you have
+  no tasks" rather than "the backend is down"; and
+  `tasks/pushNotificationConfig/get` returned `-32001 not found` for an outage
+  while `set` returned `-32603` for the same one, giving callers two
+  contradictory signals about a single failure.
+
+  `tasks/cancel` is the fourth: recording CANCELED *is* what cancelling does,
+  so a failed write there is the operation failing, not "work happened that
+  could not be recorded". It answered with a CANCELED task while the store
+  still held the old state, leaving `tasks/get` to contradict it.
+
+- **Task-store write failures are logged instead of discarded.** Each
+  persistence call was a bare `let _ =`, so a store outage produced tasks that
+  `message/send` reported as COMPLETED and `tasks/get` then reported as
+  missing, with nothing logged in between. The response is unchanged — the work
+  really did run — but the failure now reaches the operator.
+
+### Changed (BREAKING)
+
+- **`TaskStore` carries the owner; `PushConfigStore` is new.** Every
+  `TaskStore` method now takes a `&CallContext` and returns `StoreError`
+  instead of `String`, and `list` takes a `&ListParams`. Push-notification
+  configs moved out of the server's own state into a matching
+  `PushConfigStore` trait.
+
+  This closes two holes that a process-memory `task_id -> owner` map beside the
+  store could not: the map had to be capped (100 000 entries), which made an
+  evicted task permanently unreachable to its owner; and it started empty after
+  a restart, so **every task in a consumer-supplied persistent store was
+  permanently unreachable to its genuine owner** — `tasks/get` / `tasks/cancel`
+  and the three push-config methods returned `-32001`, `tasks/list` returned
+  `[]`. Splitting `PushConfigStore` out is what stops a restart from restoring
+  tasks whose webhook targets have evaporated. This is the shape upstream
+  already uses (`a2a-python`'s `ServerCallContext` + `OwnerResolver`, and its
+  separate `PushNotificationConfigStore`); `apcore-a2a-python` and
+  `apcore-a2a-typescript` re-export those stores directly and were never
+  affected.
+
+  The default `InMemoryTaskStore` buckets by owner, so isolation is a property
+  of the data structure rather than a check each method has to remember.
+
+  | Change | Who is affected | Migration |
+  |---|---|---|
+  | `TaskStore` methods take `ctx: &CallContext` | custom `TaskStore` implementors | add the parameter; key storage on `(owner, task_id)` |
+  | `Result<_, String>` -> `Result<_, StoreError>` | same | use `StoreError::backend` / `backend_msg` |
+  | `list()` -> `list(&ListParams, &CallContext)` | same | add both parameters |
+  | new `PushConfigStore` | callers of `A2AServerFactory::create` | pass `Arc::new(InMemoryPushConfigStore::new())`, or a persistent store alongside a persistent `TaskStore` |
+  | `A2AServerFactory::create(...)` -> `create(registry, CreateOptions)` | same | build `CreateOptions::new(..)` and chain `with_task_store` / `with_auth` / `with_explorer` |
+  | `AppState` fields are `pub(crate)` | anyone hand-building `AppState` | use `build_app` / `build_app_with_auth` / `serve` / `async_serve`, or `A2AServerFactory::create` |
+
+  `build_app` / `build_app_with_auth` / `serve` / `async_serve` are unchanged;
+  deployments on the default in-memory stores need no migration.
+
+- **`AppState` is no longer constructible outside this crate**, and
+  `A2AServerFactory::create` takes a `CreateOptions` struct instead of ten
+  positional arguments. Three releases in a row had broken hand-built
+  `AppState`s and `create` signatures; both surfaces are now closed, so adding
+  a component later is not a breaking change. `CreateOptions` is also the only
+  way to supply a custom store.
+
+### Added
+
+- **`storage` types are re-exported at the crate root** — `TaskStore`,
+  `InMemoryTaskStore`, `PushConfigStore`, `InMemoryPushConfigStore`,
+  `CallContext`, `OwnerId`, `ListParams`, `StoreError`. The documented
+  `use apcore_a2a::InMemoryTaskStore;` did not compile before this.
 
 ### Changed
 
@@ -135,12 +217,9 @@ Conformance and correctness fixes on the A2A server path, from
   so task ids cannot be probed. The push-config methods now also require the
   task to exist, matching `a2a-python`'s `on_set/get_task_push_notification_config`.
 
-  The owner map is bounded (100 000 entries, oldest evicted first). Ownership
-  has to outlive a task's execution, so entries cannot be dropped on
-  completion the way `CancelGuard` drops a cancel token; without a cap the map
-  grew by one entry per submitted task for the process lifetime. Eviction is
-  fail-closed: an evicted task becomes unreachable to its owner rather than
-  reachable by anyone else.
+  Ownership lives inside the store, keyed alongside the task itself, so it
+  survives whatever the store survives — see the breaking `TaskStore` change
+  below.
 
   Callers with no `Identity` share a single `""` owner bucket, as upstream's
   `UnauthenticatedUser` does — that covers both "no authenticator configured"
@@ -149,16 +228,12 @@ Conformance and correctness fixes on the A2A server path, from
   permissive-mode deployment gets scoping only between authenticated callers,
   with every unauthenticated caller sharing one bucket.
 
-  **Behaviour change for a non-default `TaskStore`.** Ownership is recorded in
-  process memory and `is_owned_by` fails closed, so after a restart with a
-  consumer-supplied persistent store the map is empty and every persisted task
-  is unreachable to its genuine owner — `tasks/get` / `tasks/cancel` and the
-  three push-config methods return `-32001`, `tasks/list` returns `[]`. The
-  same applies to a task evicted under the cap above. Carrying the owner across
-  a restart requires the `TaskStore` trait to carry it, which is a breaking
-  trait change and is deliberately not made here. Deployments using the default
-  `InMemoryTaskStore` are unaffected, since its contents do not survive a
-  restart either.
+  **Known limitation.** A consumer-supplied store that ignores its
+  `CallContext` disables task isolation entirely: every caller sees every task.
+  Rust cannot enforce the contract, and neither can upstream — `a2a-python`
+  states the same requirement as a SHOULD on its own `TaskStore`. The contract
+  is documented on the trait; if you supply a custom store, keeping it is
+  yours.
 - **The Agent Card advertises only ACL-allowed skills, and the filter agrees
   with enforcement.** The ACL gated the call but not the advertisement, so a
   deny-all-but-one ACL still disclosed the whole module inventory. The filter

@@ -1482,3 +1482,167 @@ async fn push_notification_delivered_to_webhook() {
     assert_eq!(received["statusUpdate"]["taskId"], json!(task_id));
     let _ = sending.await;
 }
+
+/// Build a server over caller-supplied stores.
+///
+/// Calling this twice with the same `Arc` stores models a **restart**: the
+/// stores survive, the server around them is rebuilt from scratch.
+async fn build_with_stores(
+    task_store: Arc<dyn apcore_a2a::TaskStore>,
+    push_config_store: Arc<dyn apcore_a2a::PushConfigStore>,
+) -> axum::Router {
+    let registry = echo_registry();
+    let executor = Arc::new(apcore::executor::Executor::new(
+        registry.clone(),
+        apcore::config::Config::default(),
+    ));
+    let agent_executor = Arc::new(apcore_a2a::ApCoreAgentExecutor::new(
+        executor,
+        apcore_a2a::PartConverter::new(apcore_a2a::SchemaConverter::new()),
+        300,
+    ));
+    let opts = apcore_a2a::CreateOptions::new(
+        agent_executor,
+        "test-agent",
+        "test agent",
+        "0.0.0",
+        "http://localhost:8000",
+    )
+    .with_task_store(task_store)
+    .with_push_config_store(push_config_store)
+    .with_auth(Arc::new(TestAuth));
+    let (router, _card) = apcore_a2a::A2AServerFactory::new().create(&registry, opts);
+    router
+}
+
+/// Submit a task as `bearer` and return its id.
+async fn send_as(router: axum::Router, bearer: &str) -> String {
+    let result = post_rpc_as(
+        router,
+        bearer,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "message/send",
+            "params": {
+                "message": { "messageId": "m1", "role": "ROLE_USER", "parts": [{ "data": { "hello": "world" } }] },
+                "metadata": { "skillId": "test.echo" }
+            }
+        }),
+    )
+    .await;
+    result["result"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("send failed: {result}"))
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_persistent_store_keeps_task_isolation_across_a_restart() {
+    // Ownership used to live in a process-memory map beside the store, so a
+    // consumer-supplied persistent store came back from a restart holding
+    // tasks that no longer had a recorded owner — and `is_owned_by` fails
+    // closed, which made every one of them permanently unreachable to its
+    // genuine owner (`tasks/get` -32001, `tasks/list` []). Owner now lives in
+    // the store, so a restart preserves both halves: the owner still reaches
+    // its tasks, and nobody else does.
+    let tasks: Arc<dyn apcore_a2a::TaskStore> = Arc::new(apcore_a2a::InMemoryTaskStore::new());
+    let push: Arc<dyn apcore_a2a::PushConfigStore> =
+        Arc::new(apcore_a2a::InMemoryPushConfigStore::new());
+
+    let task_id = send_as(build_with_stores(tasks.clone(), push.clone()).await, "good").await;
+
+    // Restart: same stores, a brand-new server that never saw the submission.
+    let restarted = || build_with_stores(tasks.clone(), push.clone());
+
+    let owner_get = post_rpc_as(
+        restarted().await,
+        "good",
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": task_id}}),
+    )
+    .await;
+    assert_eq!(
+        owner_get["result"]["id"].as_str(),
+        Some(task_id.as_str()),
+        "the owner must still reach its task after a restart, got {owner_get}"
+    );
+
+    let owner_list = post_rpc_as(
+        restarted().await,
+        "good",
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tasks/list", "params": {}}),
+    )
+    .await;
+    let listed: Vec<&str> = owner_list["result"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, vec![task_id.as_str()]);
+
+    // Isolation survives the restart too: another principal still sees nothing.
+    let other_get = post_rpc_as(
+        restarted().await,
+        "other",
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tasks/get", "params": {"id": task_id}}),
+    )
+    .await;
+    assert_eq!(other_get["error"]["code"], -32001);
+
+    let other_list = post_rpc_as(
+        restarted().await,
+        "other",
+        json!({"jsonrpc": "2.0", "id": 5, "method": "tasks/list", "params": {}}),
+    )
+    .await;
+    assert_eq!(other_list["result"]["tasks"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_persistent_push_config_store_keeps_its_scoping_across_a_restart() {
+    // Push configs used to live in the server's own state, so a persistent
+    // TaskStore restored tasks after a restart while their delivery targets
+    // evaporated. A separate PushConfigStore lets both come back together —
+    // still scoped to their owner.
+    let tasks: Arc<dyn apcore_a2a::TaskStore> = Arc::new(apcore_a2a::InMemoryTaskStore::new());
+    let push: Arc<dyn apcore_a2a::PushConfigStore> =
+        Arc::new(apcore_a2a::InMemoryPushConfigStore::new());
+
+    let task_id = send_as(build_with_stores(tasks.clone(), push.clone()).await, "good").await;
+    let set = post_rpc_as(
+        build_with_stores(tasks.clone(), push.clone()).await,
+        "good",
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tasks/pushNotificationConfig/set",
+            "params": {"id": task_id, "pushNotificationConfig": {"url": "https://hook.example/x"}}
+        }),
+    )
+    .await;
+    assert!(set["error"].is_null(), "set failed: {set}");
+
+    // Restart.
+    let owner_get = post_rpc_as(
+        build_with_stores(tasks.clone(), push.clone()).await,
+        "good",
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tasks/pushNotificationConfig/get",
+            "params": {"id": task_id}
+        }),
+    )
+    .await;
+    assert_eq!(
+        owner_get["result"]["pushNotificationConfig"]["url"],
+        "https://hook.example/x"
+    );
+
+    // Another principal still cannot read — or redirect — the owner's webhook.
+    let other_get = post_rpc_as(
+        build_with_stores(tasks.clone(), push.clone()).await,
+        "other",
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tasks/pushNotificationConfig/get",
+            "params": {"id": task_id}
+        }),
+    )
+    .await;
+    assert_eq!(other_get["error"]["code"], -32001);
+}

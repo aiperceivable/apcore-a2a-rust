@@ -1,6 +1,6 @@
 [package]
 name = "apcore-a2a"
-version = "0.4.4"
+version = "0.5.0"
 edition = "2021"
 description = "A2A protocol adapter for apcore — expose apcore modules as A2A agents"
 license = "Apache-2.0"

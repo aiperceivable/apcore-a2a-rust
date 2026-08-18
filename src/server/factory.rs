@@ -20,9 +20,82 @@ use crate::auth::protocol::Authenticator;
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::server::handlers::{
     explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler, AppState, AuthIdentity,
-    FilteredCard, TaskOwners,
+    FilteredCard,
 };
-use crate::storage::TaskStore;
+use crate::storage::{InMemoryPushConfigStore, InMemoryTaskStore, PushConfigStore, TaskStore};
+
+/// Everything [`A2AServerFactory::create`] needs to build a server.
+///
+/// A struct rather than a parameter list: `create` had grown to ten positional
+/// arguments behind `#[allow(clippy::too_many_arguments)]`, and every new
+/// component was another breaking signature change. Adding a field here is
+/// breaking only for callers that build it with a struct literal, which they
+/// can avoid via [`CreateOptions::new`] plus the `with_*` setters.
+pub struct CreateOptions {
+    pub executor: Arc<ApCoreAgentExecutor>,
+    pub task_store: Arc<dyn TaskStore>,
+    pub push_config_store: Arc<dyn PushConfigStore>,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub url: String,
+    pub auth: Option<Arc<dyn Authenticator>>,
+    pub explorer: bool,
+    pub explorer_prefix: String,
+}
+
+impl CreateOptions {
+    /// Options with the default in-memory stores, no authenticator and the
+    /// Explorer disabled.
+    pub fn new(
+        executor: Arc<ApCoreAgentExecutor>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        version: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            executor,
+            task_store: Arc::new(InMemoryTaskStore::new()),
+            push_config_store: Arc::new(InMemoryPushConfigStore::new()),
+            name: name.into(),
+            description: description.into(),
+            version: version.into(),
+            url: url.into(),
+            auth: None,
+            explorer: false,
+            explorer_prefix: "/explorer".to_string(),
+        }
+    }
+
+    /// Use a custom task store. See the [`TaskStore`] contract: a store that
+    /// ignores its `CallContext` disables task isolation.
+    pub fn with_task_store(mut self, task_store: Arc<dyn TaskStore>) -> Self {
+        self.task_store = task_store;
+        self
+    }
+
+    /// Use a custom push-notification config store. Pair it with a persistent
+    /// [`TaskStore`], or a restart restores tasks whose webhook targets are
+    /// gone.
+    pub fn with_push_config_store(mut self, store: Arc<dyn PushConfigStore>) -> Self {
+        self.push_config_store = store;
+        self
+    }
+
+    /// Require authentication, and derive the card's security schemes from it.
+    pub fn with_auth(mut self, auth: Arc<dyn Authenticator>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Serve the Explorer UI at `prefix`.
+    pub fn with_explorer(mut self, enabled: bool, prefix: impl Into<String>) -> Self {
+        self.explorer = enabled;
+        self.explorer_prefix = prefix.into();
+        self
+    }
+}
 
 /// Factory for building the A2A 1.0 server application.
 pub struct A2AServerFactory {
@@ -49,20 +122,19 @@ impl A2AServerFactory {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn create(
-        &self,
-        registry: &Registry,
-        executor: Arc<ApCoreAgentExecutor>,
-        task_store: Arc<dyn TaskStore>,
-        name: &str,
-        description: &str,
-        version: &str,
-        url: &str,
-        auth: Option<Arc<dyn Authenticator>>,
-        explorer: bool,
-        explorer_prefix: &str,
-    ) -> (Router, AgentCard) {
+    pub fn create(&self, registry: &Registry, opts: CreateOptions) -> (Router, AgentCard) {
+        let CreateOptions {
+            executor,
+            task_store,
+            push_config_store,
+            name,
+            description,
+            version,
+            url,
+            auth,
+            explorer,
+            explorer_prefix,
+        } = opts;
         // Security schemes (and the extended-card flag) are derived from the
         // authenticator, if one is configured.
         let security_schemes = auth.as_ref().and_then(|a| a.security_schemes());
@@ -77,10 +149,10 @@ impl A2AServerFactory {
 
         let agent_card = self.agent_card_builder.build(
             registry,
-            name,
-            description,
-            version,
-            url,
+            &name,
+            &description,
+            &version,
+            &url,
             capabilities,
             security_schemes,
         );
@@ -128,8 +200,7 @@ impl A2AServerFactory {
             agent_card: Arc::new(FilteredCard::new(Arc::new(card_value))),
             explorer_card,
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
-            push_configs: Arc::new(Mutex::new(HashMap::new())),
-            task_owners: Arc::new(Mutex::new(TaskOwners::default())),
+            push_config_store,
             http: reqwest::Client::new(),
         };
 

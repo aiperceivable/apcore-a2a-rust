@@ -14,8 +14,7 @@ use crate::adapters::parts::PartConverter;
 use crate::adapters::schema::SchemaConverter;
 use crate::auth::protocol::Authenticator;
 use crate::server::executor::ApCoreAgentExecutor;
-use crate::server::factory::A2AServerFactory;
-use crate::storage::{InMemoryTaskStore, TaskStore};
+use crate::server::factory::{A2AServerFactory, CreateOptions};
 
 #[derive(Debug, Error)]
 pub enum APCoreA2AError {
@@ -222,21 +221,19 @@ pub async fn build_app_with_auth(
         part_converter,
         config.execution_timeout,
     ));
-    let task_store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
-
     let factory = A2AServerFactory::new();
-    let (router, card) = factory.create(
-        executor.registry(),
+    let mut opts = CreateOptions::new(
         agent_executor,
-        task_store,
         &config.name,
         &config.description,
         &config.version,
         &config.url,
-        auth,
-        config.explorer,
-        "/explorer",
-    );
+    )
+    .with_explorer(config.explorer, "/explorer");
+    if let Some(authenticator) = auth {
+        opts = opts.with_auth(authenticator);
+    }
+    let (router, card) = factory.create(executor.registry(), opts);
     let router = apply_cors(router, &config.cors_origins);
     Ok((router, card))
 }

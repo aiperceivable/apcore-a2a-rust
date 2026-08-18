@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::adapters::errors::{carries_caller_detail, sanitize_message, ErrorMapper};
 use crate::server::executor::ApCoreAgentExecutor;
-use crate::storage::TaskStore;
+use crate::storage::{CallContext, ListParams, OwnerId, PushConfigStore, StoreError, TaskStore};
 use crate::types::{
     Artifact, Message, StreamEvent, Task, TaskArtifactUpdateEvent, TaskState, TaskStatus,
     TaskStatusUpdateEvent,
@@ -38,110 +38,27 @@ use crate::types::{
 
 /// Shared application state for the A2A server routes.
 #[derive(Clone)]
+/// Fields are `pub(crate)` and there is no public constructor: the only
+/// supported way to build a server is `build_app` / `build_app_with_auth` /
+/// `serve` / `async_serve`, or `A2AServerFactory::create`. Keeping the struct
+/// unconstructable from outside means adding a field later is not a breaking
+/// change — three releases in a row had already broken hand-built `AppState`s.
 pub struct AppState {
-    pub executor: Arc<ApCoreAgentExecutor>,
-    pub task_store: Arc<dyn TaskStore>,
+    pub(crate) executor: Arc<ApCoreAgentExecutor>,
+    pub(crate) task_store: Arc<dyn TaskStore>,
     /// Known skill (module) ids from the registry, for request-time validation.
-    pub skill_ids: Arc<HashSet<String>>,
+    pub(crate) skill_ids: Arc<HashSet<String>>,
     /// Per-skill input schema, so an inbound `TextPart` can be parsed against
     /// the schema the module actually declares.
-    pub input_schemas: Arc<HashMap<String, Value>>,
-    pub agent_card: Arc<FilteredCard>,
+    pub(crate) input_schemas: Arc<HashMap<String, Value>>,
+    pub(crate) agent_card: Arc<FilteredCard>,
     /// Agent card enriched with per-skill `_inputSchemas` for the Explorer UI.
-    pub explorer_card: Arc<FilteredCard>,
-    pub cancel_tokens: Arc<Mutex<HashMap<String, CancelToken>>>,
-    /// Per-task push-notification webhook configs (`tasks/pushNotificationConfig/*`).
-    pub push_configs: Arc<Mutex<HashMap<String, Value>>>,
-    /// Owner (authenticated principal) of each task, keyed by task id. Scopes
-    /// every task-addressed method so one caller cannot read, cancel or
-    /// reconfigure another's tasks.
-    pub task_owners: Arc<Mutex<TaskOwners>>,
-    pub http: reqwest::Client,
-}
-
-/// How many task→owner entries are retained before the oldest is evicted.
-///
-/// Sized so the map stays a few MB at worst while covering far more live tasks
-/// than a single process is expected to hold.
-const MAX_TRACKED_TASK_OWNERS: usize = 100_000;
-
-/// Bounded, insertion-ordered record of which principal owns which task.
-///
-/// This was a plain `HashMap` that only ever grew: one `(task_id, owner)` pair
-/// per submitted task, for the process lifetime, with no `remove` anywhere —
-/// the cancel-token map is unregistered on every exit path by `CancelGuard`,
-/// this had no equivalent, and a consumer bounding its own [`TaskStore`] via
-/// `TaskStore::delete` left the owner entry orphaned with no API to reach it.
-///
-/// Ownership has to outlive the task's execution (reading a completed task is
-/// the normal case), so entries cannot be dropped when a task reaches a
-/// terminal state. They are capped instead, and evicted oldest-first. Eviction
-/// is fail-closed exactly like any other unrecorded task: the evicted task
-/// becomes unreachable to its owner (`-32001`) rather than reachable by anyone
-/// else. A deployment holding more live tasks than the cap needs a `TaskStore`
-/// that carries the owner itself — see [`is_owned_by`].
-#[derive(Debug, Default)]
-pub struct TaskOwners {
-    by_task: HashMap<String, String>,
-    /// Task ids in insertion order, oldest first. Kept in lock-step with
-    /// `by_task`: exactly one entry per key, pushed only on first insert.
-    insertion_order: std::collections::VecDeque<String>,
-}
-
-impl TaskOwners {
-    /// Record `owner` as the owner of `task_id`, evicting the oldest entry when
-    /// the cap is reached. Re-recording a known task updates it in place.
-    fn insert(&mut self, task_id: &str, owner: &str) {
-        if let Some(existing) = self.by_task.get_mut(task_id) {
-            existing.clear();
-            existing.push_str(owner);
-            return;
-        }
-        while self.by_task.len() >= MAX_TRACKED_TASK_OWNERS {
-            match self.insertion_order.pop_front() {
-                Some(oldest) => {
-                    self.by_task.remove(&oldest);
-                }
-                // INVARIANT: `insertion_order` holds one entry per `by_task`
-                // key, so it cannot be empty while `by_task` is over the cap.
-                None => break,
-            }
-        }
-        self.by_task.insert(task_id.to_string(), owner.to_string());
-        self.insertion_order.push_back(task_id.to_string());
-    }
-
-    /// Whether `owner` is the recorded owner of `task_id`.
-    fn is_owned_by(&self, task_id: &str, owner: &str) -> bool {
-        self.by_task
-            .get(task_id)
-            .is_some_and(|task_owner| task_owner == owner)
-    }
-
-    /// The ids of every task recorded as belonging to `owner`.
-    fn tasks_of(&self, owner: &str) -> HashSet<String> {
-        self.by_task
-            .iter()
-            .filter(|(_, task_owner)| task_owner.as_str() == owner)
-            .map(|(task_id, _)| task_id.clone())
-            .collect()
-    }
-}
-
-/// Owner key for a request's authenticated principal.
-///
-/// Mirrors the upstream A2A stores, which scope task storage by an owner
-/// resolved from the call context (`a2a-python`'s `OwnerResolver`, whose
-/// default is `context.user.user_name`; `a2a-js`'s per-context bucket).
-///
-/// Every request without an `Identity` resolves to the same empty owner,
-/// exactly as upstream's `UnauthenticatedUser.user_name` does. That covers both
-/// "no authenticator configured" — a single-tenant deployment keeps its current
-/// behaviour — and an authenticator running with `require_auth = false`, whose
-/// unauthenticated requests all share the one bucket while authenticated ones
-/// are scoped normally.
-fn owner_key(identity: Option<&Identity>) -> String {
-    identity.map(|i| i.id().to_string()).unwrap_or_default()
+    pub(crate) explorer_card: Arc<FilteredCard>,
+    pub(crate) cancel_tokens: Arc<Mutex<HashMap<String, CancelToken>>>,
+    /// Per-task push-notification webhook configs
+    /// (`tasks/pushNotificationConfig/*`), scoped to their owner by the store.
+    pub(crate) push_config_store: Arc<dyn PushConfigStore>,
+    pub(crate) http: reqwest::Client,
 }
 
 /// Embedded Explorer UI (served at the explorer prefix).
@@ -272,7 +189,7 @@ impl FilteredCard {
         executor: &ApCoreAgentExecutor,
         identity: Option<&Identity>,
     ) -> Arc<Value> {
-        let key = owner_key(identity);
+        let key = OwnerId::from_identity(identity).as_str().to_string();
         if let Some(cached) = self.cache.lock().unwrap().get(&key) {
             return cached.clone();
         }
@@ -348,6 +265,7 @@ const CODE_METHOD_NOT_FOUND: i32 = -32601;
 const CODE_INVALID_PARAMS: i32 = -32602;
 const CODE_TASK_NOT_FOUND: i32 = -32001;
 const CODE_TASK_NOT_CANCELABLE: i32 = -32002;
+const CODE_INTERNAL_ERROR: i32 = -32603;
 
 /// Extract `metadata.skillId` from the JSON-RPC params.
 fn skill_id_of(params: &Value) -> Option<String> {
@@ -505,36 +423,36 @@ pub async fn jsonrpc_handler(
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
-    let owner = owner_key(identity.as_ref());
+    let ctx = CallContext::from_identity(identity.as_ref());
 
     match method {
-        "message/send" => match handle_send(&state, identity, &owner, &params).await {
+        "message/send" => match handle_send(&state, identity, &ctx, &params).await {
             Ok(task) => Json(rpc_result(&id, task)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "message/stream" => handle_stream(&state, identity, &owner, &params, id).await,
-        "tasks/get" => match handle_get(&state, &owner, &params).await {
+        "message/stream" => handle_stream(&state, identity, &ctx, &params, id).await,
+        "tasks/get" => match handle_get(&state, &ctx, &params).await {
             Ok(task) => Json(rpc_result(&id, task)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "tasks/cancel" => match handle_cancel(&state, &owner, &params).await {
+        "tasks/cancel" => match handle_cancel(&state, &ctx, &params).await {
             Ok(task) => Json(rpc_result(&id, task)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "tasks/list" => {
-            let tasks = handle_list(&state, &owner).await;
-            Json(rpc_result(&id, json!({ "tasks": tasks }))).into_response()
-        }
-        "tasks/pushNotificationConfig/set" => match handle_push_set(&state, &owner, &params) {
+        "tasks/list" => match handle_list(&state, &ctx).await {
+            Ok(tasks) => Json(rpc_result(&id, json!({ "tasks": tasks }))).into_response(),
+            Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
+        },
+        "tasks/pushNotificationConfig/set" => match handle_push_set(&state, &ctx, &params).await {
             Ok(v) => Json(rpc_result(&id, v)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
-        "tasks/pushNotificationConfig/get" => match handle_push_get(&state, &owner, &params) {
+        "tasks/pushNotificationConfig/get" => match handle_push_get(&state, &ctx, &params).await {
             Ok(v) => Json(rpc_result(&id, v)).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
         },
         "tasks/pushNotificationConfig/delete" => {
-            match handle_push_delete(&state, &owner, &params) {
+            match handle_push_delete(&state, &ctx, &params).await {
                 Ok(v) => Json(rpc_result(&id, v)).into_response(),
                 Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
             }
@@ -624,10 +542,9 @@ async fn fail_task(
     state: &AppState,
     task_id: &str,
     context_id: &str,
-    owner: &str,
+    ctx: &CallContext,
     message: impl Into<String>,
 ) -> Value {
-    register_owner(state, task_id, owner);
     let status = TaskStatus::with_message(TaskState::Failed, Message::agent_text(message));
     let task = Task {
         id: task_id.to_string(),
@@ -637,16 +554,18 @@ async fn fail_task(
         history: vec![],
     };
     let task_json = serde_json::to_value(&task).unwrap();
-    let _ = state.task_store.save(task_id, task_json.clone()).await;
+    save_task(state, task_id, task_json.clone(), ctx).await;
     notify_push(
         state,
         task_id,
+        ctx,
         &StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.to_string(),
             context_id: context_id.to_string(),
             status,
         }),
-    );
+    )
+    .await;
     task_json
 }
 
@@ -657,11 +576,10 @@ async fn failed_task_stream(
     state: &AppState,
     task_id: String,
     context_id: String,
-    owner: &str,
+    ctx: &CallContext,
     id: Value,
     message: String,
 ) -> Response {
-    register_owner(state, &task_id, owner);
     let status = TaskStatus::with_message(TaskState::Failed, Message::agent_text(message));
     let task = Task {
         id: task_id.clone(),
@@ -670,16 +588,13 @@ async fn failed_task_stream(
         artifacts: vec![],
         history: vec![],
     };
-    let _ = state
-        .task_store
-        .save(&task_id, serde_json::to_value(&task).unwrap())
-        .await;
+    save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await;
     let terminal = StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
         task_id: task_id.clone(),
         context_id: context_id.clone(),
         status,
     });
-    notify_push(state, &task_id, &terminal);
+    notify_push(state, &task_id, ctx, &terminal).await;
     let events = vec![
         StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.clone(),
@@ -709,7 +624,7 @@ fn submitted_task(task_id: &str, context_id: &str) -> Task {
 async fn handle_send(
     state: &AppState,
     identity: Option<Identity>,
-    owner: &str,
+    ctx: &CallContext,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let (skill_id, task_id, context_id, inputs) = match parse_request(state, params) {
@@ -719,7 +634,7 @@ async fn handle_send(
             task_id,
             context_id,
             message,
-        }) => return Ok(fail_task(state, &task_id, &context_id, owner, message).await),
+        }) => return Ok(fail_task(state, &task_id, &context_id, ctx, message).await),
     };
 
     // Reject unknown skills with a FAILED task (Python/TS parity).
@@ -728,13 +643,12 @@ async fn handle_send(
             state,
             &task_id,
             &context_id,
-            owner,
+            ctx,
             format!("Skill not found: {skill_id}"),
         )
         .await);
     }
 
-    register_owner(state, &task_id, owner);
     let mut task = submitted_task(&task_id, &context_id);
 
     let cancel = CancelToken::new();
@@ -746,10 +660,7 @@ async fn handle_send(
         task_id: task_id.clone(),
     };
 
-    let _ = state
-        .task_store
-        .save(&task_id, serde_json::to_value(&task).unwrap())
-        .await;
+    save_task(state, &task_id, serde_json::to_value(&task).unwrap(), ctx).await;
 
     let result = state
         .executor
@@ -770,18 +681,20 @@ async fn handle_send(
         }
     }
     let task_json = serde_json::to_value(&task).unwrap();
-    let _ = state.task_store.save(&task_id, task_json.clone()).await;
+    save_task(state, &task_id, task_json.clone(), ctx).await;
 
     // Deliver the terminal status to any registered webhook.
     notify_push(
         state,
         &task_id,
+        ctx,
         &StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
             status: task.status.clone(),
         }),
-    );
+    )
+    .await;
     Ok(task_json)
 }
 
@@ -789,7 +702,7 @@ async fn handle_send(
 async fn handle_stream(
     state: &AppState,
     identity: Option<Identity>,
-    owner: &str,
+    ctx: &CallContext,
     params: &Value,
     id: Value,
 ) -> Response {
@@ -802,15 +715,17 @@ async fn handle_stream(
             task_id,
             context_id,
             message,
-        }) => return failed_task_stream(state, task_id, context_id, owner, id, message).await,
+        }) => return failed_task_stream(state, task_id, context_id, ctx, id, message).await,
     };
 
-    register_owner(state, &task_id, owner);
     let cancel = CancelToken::new();
     register_cancel(state, &task_id, cancel.clone());
 
     let (tx, rx) = mpsc::channel::<StreamEvent>(16);
     let state2 = state.clone();
+    // The spawned task outlives this call, so it needs an owned context to
+    // scope its own stores writes and webhook lookup.
+    let ctx2 = ctx.clone();
     let skill_known = state.skill_ids.contains(&skill_id);
 
     tokio::spawn(async move {
@@ -847,16 +762,19 @@ async fn handle_stream(
                 artifacts: vec![],
                 history: vec![],
             };
-            let _ = state2
-                .task_store
-                .save(&task_id, serde_json::to_value(&task).unwrap())
-                .await;
+            save_task(
+                &state2,
+                &task_id,
+                serde_json::to_value(&task).unwrap(),
+                &ctx2,
+            )
+            .await;
             let terminal_event = StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
                 status,
             });
-            notify_push(&state2, &task_id, &terminal_event);
+            notify_push(&state2, &task_id, &ctx2, &terminal_event).await;
             send(terminal_event).await;
             return;
         }
@@ -927,17 +845,20 @@ async fn handle_stream(
             artifacts: vec![],
             history: vec![],
         };
-        let _ = state2
-            .task_store
-            .save(&task_id, serde_json::to_value(&task).unwrap())
-            .await;
+        save_task(
+            &state2,
+            &task_id,
+            serde_json::to_value(&task).unwrap(),
+            &ctx2,
+        )
+        .await;
         let terminal_event = StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.clone(),
             context_id: context_id.clone(),
             status: final_status,
         });
         // Deliver the terminal status to any registered webhook.
-        notify_push(&state2, &task_id, &terminal_event);
+        notify_push(&state2, &task_id, &ctx2, &terminal_event).await;
         send(terminal_event).await;
         // `_cancel_guard` unregisters the cancel token on drop (all exit paths).
     });
@@ -951,20 +872,23 @@ async fn handle_stream(
 }
 
 /// `tasks/get` — return a stored task by id, if the caller owns it.
-async fn handle_get(state: &AppState, owner: &str, params: &Value) -> Result<Value, (i32, String)> {
+async fn handle_get(
+    state: &AppState,
+    ctx: &CallContext,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
     let task_id = params.get("id").and_then(Value::as_str).ok_or((
         CODE_INVALID_PARAMS,
         "Missing required parameter: id".to_string(),
     ))?;
-    if !is_owned_by(state, task_id, owner) {
-        // Masked as "not found" rather than "forbidden", matching how ACL
-        // denials are reported (srs FR-ERR-003): a caller must not learn that
-        // another principal's task id exists.
-        return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
-    }
-    match state.task_store.get(task_id).await {
+    // Another principal's task reads back as absent — the store scopes by
+    // `ctx.owner()`. Masked as "not found" rather than "forbidden", matching
+    // how ACL denials are reported (srs FR-ERR-003): a caller must not learn
+    // that another principal's task id exists.
+    match state.task_store.get(task_id, ctx).await {
         Ok(Some(task)) => Ok(task),
-        _ => Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
+        Ok(None) => Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
+        Err(e) => Err(store_failure(&format!("task store read for {task_id}"), e)),
     }
 }
 
@@ -974,21 +898,12 @@ async fn handle_get(state: &AppState, owner: &str, params: &Value) -> Result<Val
 /// tasks other callers submitted. The upstream A2A stores scope by owner
 /// (`a2a-python`'s `OwnerResolver`, `a2a-js`'s per-context bucket); the spec
 /// repo is silent on it, so this follows upstream.
-async fn handle_list(state: &AppState, owner: &str) -> Vec<Value> {
-    let owned: HashSet<String> = state.task_owners.lock().unwrap().tasks_of(owner);
-
+async fn handle_list(state: &AppState, ctx: &CallContext) -> Result<Vec<Value>, (i32, String)> {
     state
         .task_store
-        .list()
+        .list(&ListParams::new(), ctx)
         .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|task| {
-            task.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| owned.contains(id))
-        })
-        .collect()
+        .map_err(|e| store_failure("task store list", e))
 }
 
 /// `tasks/cancel` — signal cooperative cancellation and mark the task canceled.
@@ -1002,7 +917,7 @@ async fn handle_list(state: &AppState, owner: &str) -> Vec<Value> {
 /// COMPLETED task's artifacts, destroying the result it had already produced.
 async fn handle_cancel(
     state: &AppState,
-    owner: &str,
+    ctx: &CallContext,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let task_id = params.get("id").and_then(Value::as_str).ok_or((
@@ -1010,18 +925,13 @@ async fn handle_cancel(
         "Missing required parameter: id".to_string(),
     ))?;
 
-    // Another principal's task is reported as missing, not as forbidden.
-    if !is_owned_by(state, task_id, owner) {
-        return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
-    }
-
-    let stored = state
-        .task_store
-        .get(task_id)
-        .await
-        .ok()
-        .flatten()
-        .ok_or((CODE_TASK_NOT_FOUND, "Task not found".to_string()))?;
+    // Another principal's task reads back as absent, so it is reported as
+    // missing rather than as forbidden.
+    let stored = match state.task_store.get(task_id, ctx).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
+        Err(e) => return Err(store_failure(&format!("task store read for {task_id}"), e)),
+    };
 
     // A task whose stored JSON cannot be read back is unusable, not cancelable.
     let mut task: Task = serde_json::from_value(stored)
@@ -1050,18 +960,29 @@ async fn handle_cancel(
     );
     let context_id = task.context_id.clone();
     let task_json = serde_json::to_value(&task).unwrap();
-    let _ = state.task_store.save(task_id, task_json.clone()).await;
+    // Cancelling *is* this write, so unlike the send/stream paths a failure
+    // here is not "work happened but could not be recorded" — it is the
+    // operation failing. Answering CANCELED anyway would leave the caller
+    // believing a task is cancelled while the store still reads WORKING. The
+    // cancel token is already signalled, so retrying is the right response.
+    state
+        .task_store
+        .save(task_id, task_json.clone(), ctx)
+        .await
+        .map_err(|e| store_failure(&format!("task store write for {task_id}"), e))?;
 
     // Deliver the terminal CANCELED status to any registered webhook.
     notify_push(
         state,
         task_id,
+        ctx,
         &StreamEvent::StatusUpdate(TaskStatusUpdateEvent {
             task_id: task_id.to_string(),
             context_id,
             status: task.status.clone(),
         }),
-    );
+    )
+    .await;
     Ok(task_json)
 }
 
@@ -1075,24 +996,29 @@ async fn handle_cancel(
 /// scopes these three the same way — `a2a-python`'s
 /// `on_set/get_task_push_notification_config` both load the task from the
 /// context-scoped `task_store` first and raise `TaskNotFoundError`.
-fn owned_task_id<'a>(
+async fn owned_task_id<'a>(
     state: &AppState,
-    owner: &str,
+    ctx: &CallContext,
     params: &'a Value,
 ) -> Result<&'a str, (i32, String)> {
     let task_id = params.get("id").and_then(Value::as_str).ok_or((
         CODE_INVALID_PARAMS,
         "Missing required parameter: id".to_string(),
     ))?;
-    if !is_owned_by(state, task_id, owner) {
-        return Err((CODE_TASK_NOT_FOUND, "Task not found".to_string()));
+    match state.task_store.get(task_id, ctx).await {
+        Ok(Some(_)) => Ok(task_id),
+        Ok(None) => Err((CODE_TASK_NOT_FOUND, "Task not found".to_string())),
+        Err(e) => Err(store_failure(&format!("task store read for {task_id}"), e)),
     }
-    Ok(task_id)
 }
 
 /// `tasks/pushNotificationConfig/set` — register a webhook for a task.
-fn handle_push_set(state: &AppState, owner: &str, params: &Value) -> Result<Value, (i32, String)> {
-    let task_id = owned_task_id(state, owner, params)?;
+async fn handle_push_set(
+    state: &AppState,
+    ctx: &CallContext,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let task_id = owned_task_id(state, ctx, params).await?;
     let cfg = params.get("pushNotificationConfig").cloned().ok_or((
         CODE_INVALID_PARAMS,
         "Missing pushNotificationConfig".to_string(),
@@ -1104,42 +1030,61 @@ fn handle_push_set(state: &AppState, owner: &str, params: &Value) -> Result<Valu
         ));
     }
     state
-        .push_configs
-        .lock()
-        .unwrap()
-        .insert(task_id.to_string(), cfg.clone());
+        .push_config_store
+        .save(task_id, cfg.clone(), ctx)
+        .await
+        .map_err(|e| store_failure(&format!("push config store write for {task_id}"), e))?;
     Ok(json!({ "taskId": task_id, "pushNotificationConfig": cfg }))
 }
 
 /// `tasks/pushNotificationConfig/get` — return a task's webhook config.
-fn handle_push_get(state: &AppState, owner: &str, params: &Value) -> Result<Value, (i32, String)> {
-    let task_id = owned_task_id(state, owner, params)?;
-    match state.push_configs.lock().unwrap().get(task_id) {
-        Some(cfg) => Ok(json!({ "taskId": task_id, "pushNotificationConfig": cfg })),
-        None => Err((
+async fn handle_push_get(
+    state: &AppState,
+    ctx: &CallContext,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let task_id = owned_task_id(state, ctx, params).await?;
+    match state.push_config_store.get(task_id, ctx).await {
+        Ok(Some(cfg)) => Ok(json!({ "taskId": task_id, "pushNotificationConfig": cfg })),
+        Ok(None) => Err((
             CODE_TASK_NOT_FOUND,
             "Push notification config not found".to_string(),
+        )),
+        Err(e) => Err(store_failure(
+            &format!("push config store read for {task_id}"),
+            e,
         )),
     }
 }
 
 /// `tasks/pushNotificationConfig/delete` — remove a task's webhook config.
-fn handle_push_delete(
+async fn handle_push_delete(
     state: &AppState,
-    owner: &str,
+    ctx: &CallContext,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    let task_id = owned_task_id(state, owner, params)?;
-    state.push_configs.lock().unwrap().remove(task_id);
+    let task_id = owned_task_id(state, ctx, params).await?;
+    // Reporting success here would tell a caller its webhook is revoked while
+    // deliveries keep going to that URL — the one failure mode this method must
+    // not have, since revoking a leaked webhook is a reason to call it.
+    state
+        .push_config_store
+        .delete(task_id, ctx)
+        .await
+        .map_err(|e| store_failure(&format!("push config store delete for {task_id}"), e))?;
     Ok(Value::Null)
 }
 
 /// Deliver an event to a task's registered webhook (if any), retrying with
 /// exponential backoff. Fire-and-forget: spawned so it never blocks the caller.
-fn notify_push(state: &AppState, task_id: &str, event: &StreamEvent) {
-    let cfg = match state.push_configs.lock().unwrap().get(task_id).cloned() {
-        Some(c) => c,
-        None => return,
+async fn notify_push(state: &AppState, task_id: &str, ctx: &CallContext, event: &StreamEvent) {
+    let cfg = match state.push_config_store.get(task_id, ctx).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("push config store read failed for {task_id}: {e}");
+            return;
+        }
     };
     let url = match cfg.get("url").and_then(Value::as_str) {
         Some(u) => u.to_string(),
@@ -1170,26 +1115,35 @@ fn notify_push(state: &AppState, task_id: &str, event: &StreamEvent) {
     });
 }
 
-/// Record which principal a task belongs to.
-fn register_owner(state: &AppState, task_id: &str, owner: &str) {
-    state.task_owners.lock().unwrap().insert(task_id, owner);
+/// Classify a store backend failure as an internal error, never as a missing
+/// task.
+///
+/// Collapsing it to `-32001` reports "your task does not exist" when the truth
+/// is that the backend is unreachable, and the two call for opposite responses:
+/// an A2A agent reading *not found* re-submits work that is actually still
+/// there, while *internal error* is correctly not caller-fixable. This is the
+/// same rule the task-status surface follows (srs FR-ERR-004 / FR-ERR-008) —
+/// internal failures keep the fixed string and stay distinct from anything the
+/// caller could act on. The classification also has to be the same for reads
+/// and writes: `set` reporting `-32603` while `get` reported `-32001` for one
+/// and the same outage gave callers two contradictory signals.
+fn store_failure(what: &str, e: StoreError) -> (i32, String) {
+    tracing::warn!("{what}: {e}");
+    (CODE_INTERNAL_ERROR, "Internal server error".to_string())
 }
 
-/// Whether `owner` may read, cancel or reconfigure `task_id`.
+/// Persist a task, logging rather than propagating a store failure.
 ///
-/// Fails closed: a task with no recorded owner is visible to nobody. The
-/// ownership map lives in process memory, so a custom [`TaskStore`] that
-/// outlives the process would need to carry the owner itself — that is a
-/// `TaskStore` trait change and is deliberately not made here. Two consequences
-/// follow, both disclosed in the CHANGELOG: after a restart with a persistent
-/// store every persisted task is unreachable to its genuine owner, and a task
-/// evicted from [`TaskOwners`] under its cap becomes unreachable too.
-fn is_owned_by(state: &AppState, task_id: &str, owner: &str) -> bool {
-    state
-        .task_owners
-        .lock()
-        .unwrap()
-        .is_owned_by(task_id, owner)
+/// Every call site here has already run the task to a known state, so a failed
+/// write cannot change what is returned to the caller — turning it into a
+/// JSON-RPC error would report "failed" for work that actually succeeded. It
+/// must not stay silent either: previously each of these was a bare `let _ =`,
+/// so a store outage produced tasks that `message/send` reported as COMPLETED
+/// and `tasks/get` then reported as missing, with nothing logged in between.
+async fn save_task(state: &AppState, task_id: &str, task: Value, ctx: &CallContext) {
+    if let Err(e) = state.task_store.save(task_id, task, ctx).await {
+        tracing::warn!("task store write failed for {task_id}: {e}");
+    }
 }
 
 fn register_cancel(state: &AppState, task_id: &str, token: CancelToken) {
@@ -1342,43 +1296,6 @@ mod tests {
             status_text(&error_to_status(&err)).as_deref(),
             Some("Task not found")
         );
-    }
-
-    #[test]
-    fn task_owners_stays_bounded_and_evicts_oldest_first() {
-        // The owner map had insert/get/iter and no remove anywhere, so it grew
-        // by one `(String, String)` per submitted task for the process
-        // lifetime. It is now capped, evicting oldest-first.
-        let mut owners = TaskOwners::default();
-        for i in 0..MAX_TRACKED_TASK_OWNERS + 10 {
-            owners.insert(&format!("task-{i}"), "u1");
-        }
-        assert_eq!(owners.by_task.len(), MAX_TRACKED_TASK_OWNERS);
-        assert_eq!(owners.insertion_order.len(), MAX_TRACKED_TASK_OWNERS);
-
-        // The 10 oldest are gone — fail-closed, not reassigned to anyone else.
-        assert!(!owners.is_owned_by("task-0", "u1"));
-        assert!(!owners.is_owned_by("task-9", "u1"));
-        assert!(!owners.is_owned_by("task-0", ""));
-        // The newest survive.
-        assert!(owners.is_owned_by("task-10", "u1"));
-        assert!(owners.is_owned_by(&format!("task-{}", MAX_TRACKED_TASK_OWNERS + 9), "u1"));
-    }
-
-    #[test]
-    fn task_owners_reinsert_updates_in_place_without_growing_the_queue() {
-        // `register_owner` runs on more than one path per task; a repeat must
-        // not push a second `insertion_order` entry (which would let the map
-        // and the queue drift and evict a live task early).
-        let mut owners = TaskOwners::default();
-        owners.insert("t1", "u1");
-        owners.insert("t1", "u2");
-        assert_eq!(owners.by_task.len(), 1);
-        assert_eq!(owners.insertion_order.len(), 1);
-        assert!(owners.is_owned_by("t1", "u2"));
-        assert!(!owners.is_owned_by("t1", "u1"));
-        assert_eq!(owners.tasks_of("u2"), HashSet::from(["t1".to_string()]));
-        assert!(owners.tasks_of("u1").is_empty());
     }
 
     #[test]
