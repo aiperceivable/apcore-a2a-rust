@@ -5,6 +5,178 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-01
+
+Resolves `aiperceivable/apcore-a2a` issues #2, #3, #4, #5 and `apcore-a2a-rust` #2.
+One principle runs through all five: **apcore already draws these distinctions,
+and a transport binding's job is to convey them, not to flatten them.**
+
+Suite: 190 tests (was 164).
+Runtime floor moves to apcore 0.28.0 / apcore-toolkit 0.10.2 (`apcore = ">=0.28, <0.29"` / `apcore-toolkit = ">=0.10.2"`).
+
+### Changed
+
+- **A governance refusal is reported as itself** (spec srs FR-ERR-003, FR-ERR-009,
+  FR-ERR-010, FR-ERR-012). `ACL_DENIED` moves from `-32001 "Task not found"` to
+  `-32040 "Access denied"`; `APPROVAL_DENIED` and `APPROVAL_TIMEOUT` leave the
+  `-32603` catch-all for `-32041 "Approval denied"` and `-32042 "Approval timed
+  out"`. All three now reach `TASK_STATE_REJECTED` instead of
+  `TASK_STATE_FAILED`, which matters most on `message/send`, where the response
+  is a JSON-RPC `result` and the error code never reaches the caller at all —
+  the state and its message are the entire payload.
+
+  The old mapping told an agent a *different* failure had happened, one whose
+  correct response was the opposite of the real one: `"Task not found"` sends a
+  caller back to re-fetch or re-send the one thing that was fine, and
+  `"Internal server error"` is the canonical *retryable* failure — for a call a
+  human had explicitly refused. A2A §13.2's MUST NOT forbids revealing *the
+  existence of a resource*, not the *class* of failure, so a fixed
+  `"Access denied"` naming no caller, target or rule satisfies it while still
+  telling an agent to stop.
+
+  `-32001` now means only "unknown task id, or a task owned by another
+  principal". `APPROVAL_PENDING` is untouched: still a resumable
+  `TASK_STATE_INPUT_REQUIRED` carrying its message verbatim, which is how a
+  caller learns the approval id it resumes with.
+
+  **Breaking** for callers that matched `-32001` or the literal `"Task not
+  found"` to detect an authorization failure.
+
+- **The public Agent Card shows what an anonymous caller could actually invoke**
+  (spec srs FR-AGC-003): every registered skill, minus those the ACL denies to
+  the anonymous principal, minus those annotated `requires_approval`. The filter
+  resolves one identity, so it runs once at card-build time — never per request
+  on the auth-exempt `/.well-known/` route.
+
+- **The extended Agent Card carries what the authenticated caller may invoke**
+  (spec srs FR-AGC-004), including `requires_approval` skills, resolved against
+  that caller's own identity.
+
+- **`capabilities.extendedAgentCard` is no longer derived from `auth != null`
+  alone** (spec srs FR-AGC-002, FR-AGC-006): this binding advertises the
+  capability only because it now serves it.
+
+- **Card visibility reads apcore's two governance axes apart** (spec srs
+  FR-AGC-003 "The two axes" and criterion 11; FR-AGC-004 criteria 2 and 10).
+  apcore 0.28.0 (`PROTOCOL_SPEC` §6.1.6) gave an ACL rule an `approval: required`
+  field orthogonal to `effect`, so one check now resolves two independent results
+  — may this caller reach this target, and must this call be put to a human — and
+  made the legacy boolean `ACL.check` **fail closed** on the second. This binding
+  filtered its cards on that boolean. Left alone, a skill the ACL *allows* the
+  caller but gates behind a human would have silently vanished from the
+  **extended** card too: a refusal the ACL never issued, and the caller left
+  unable to learn that a capability it holds exists at all.
+
+  Every card filter now reads `ACL::check_access` and filters on the
+  authorization axis alone. The approval axis decides only *which surface*: it
+  joins the module's `requires_approval` annotation as the second source the
+  public card subtracts, composed by union exactly as apcore §6.9 composes them.
+  Since 0.28.0 the annotation describes the *module*, not the call (apcore#110),
+  so reading it alone would leave on the public card a skill an anonymous caller
+  cannot in fact just call.
+
+  The bug this closes was one line: `handlers::acl_filtered_card` called
+  `acl.check(...)`. `ACL::check_access` returns an `AccessDecision`, and the filter
+  now reads `decision.is_allowed()` for visibility and `decision.approval_required`
+  only to decide which surface — the `hide_approval_gated` argument, `true` for the
+  public card and `false` for the extended one. The projection argument is `None`:
+  a card is discovery and there is no call site.
+
+  `apcore::acl::ACLRule` also gained a required `approval` field, a source break for
+  the struct literals in this crate's integration tests.
+
+- **apcore's `system.*` management namespace never reaches the public Agent Card**
+  (spec srs FR-AGC-003 criteria 12 and 13, FR-AGC-004 criterion 11;
+  `aiperceivable/apcore-a2a#5`). Removed **unconditionally** — independent of ACL
+  state, of the `requires_approval` annotation, and of how `sys_modules` is
+  configured. Kept on the extended card, filtered per identity like any other
+  skill.
+
+  Every other subtraction the public card makes is governance-shaped, and with no
+  ACL configured they all collapse: the ACL predicates are empty and the
+  annotation covers only the three `system.control.*` write modules — leaving the
+  six read modules, which enumerate the deployment's module inventory, health and
+  usage, published to any anonymous caller on the auth-exempt `/.well-known/`
+  route. `ACL.discover()` yields nothing for a missing root by design, so "no ACL
+  at all" is the default rather than an edge case, and the rule that has to hold
+  there cannot be shaped like a governance verdict.
+
+- **Warns when an unprotected control surface is served** (spec srs FR-AGC-007),
+  asserted by capturing `tracing` output with a thread-local
+  `subscriber::set_default` rather than a global subscriber, so the check cannot
+  race the other tests in the integration binary.
+  Server construction reads apcore's `Executor::governance_state` and warns when
+  `unprotected_control_surface` is true. It never refuses to start and never
+  alters a card. Withholding `system.*` from the public card removes the surface
+  from *discovery*, not from *dispatch*: apcore's approval gate warns once and
+  continues with no `ApprovalHandler`, so the write modules stay callable, and the
+  card rule must not be mistaken for a fix to that.
+
+### Added
+
+- **apcore's behavioral annotations reach the wire** (spec srs FR-SKL-004):
+  `readonly`, `destructive`, `idempotent` and `requires_approval` are emitted as
+  namespaced entries in the standard `tags` field — `apcore:readonly`,
+  `apcore:destructive`, `apcore:idempotent`, `apcore:requires-approval` — in
+  that fixed order, appended after the module's own tags and de-duplicated
+  against them. Only `true` flags are emitted.
+
+  A2A 1.0 `AgentSkill` has no `extensions` and no `metadata` member, so `tags`
+  is the only carrier that exists. Without them the card carried enough to
+  *construct* a call and not enough to judge whether making it is safe — and
+  retry semantics were unusable, since `retryable` is a property of the error
+  while whether a retry is safe is a property of the operation.
+
+- **Governance refusal errors on the client**, so a refusal is not reported as
+  a transient server failure.
+
+- `A2AClientError::AccessDenied` / `ApprovalDenied` / `ApprovalTimeout`, plus
+  `A2AClientError::is_governance_refusal()`.
+
+- **`APCoreA2AConfig::disclose_refusal_reason`** (default `false`, spec srs
+  FR-ERR-011): forwards apcore's own sanitized reason for the three governance
+  codes instead of the fixed per-class string. The code never changes with the
+  flag; only the message does.
+
+- **`GET /agent/authenticatedExtendedCard` and the `GetExtendedAgentCard`
+  JSON-RPC method.** This crate advertised `capabilities.extendedAgentCard` and
+  routed neither, so a client that read the flag and called the method — which
+  A2A §3.2.x entitles it to do — got method-not-found.
+
+### Fixed
+
+- **`sys_modules` registered nothing** (`aiperceivable/apcore-a2a#5`). apcore reads
+  `sys_modules.enabled`, a **top-level** config section; the flag was a silent
+  no-op in every deployment since it was introduced.
+
+  This binding passed `&Config::default()` to `register_sys_modules`, which reads
+  `sys_modules.enabled` and returns an empty context when it is absent — and
+  `let _ =` discarded the result, so nothing reported the no-op. The config is now
+  built with the key set, the `Result` is inspected, a failure is warned about
+  rather than dropped, and the registered ids are logged.
+
+  Fixed together with the namespace rule above, deliberately in that order:
+  repairing the config path on its own is precisely what would have opened the
+  hole that rule closes.
+
+- **`async_serve` no longer derives its bind address from `config.url`** (#2).
+  `APCoreA2AConfig` gains `host` and `port`; `url` is now the Agent Card
+  endpoint only, defaulting to `http://{host}:{port}` exactly as the Python and
+  TypeScript bindings have always done. The old code string-split `url` on
+  `://` and fell back to `0.0.0.0:8000` when the split failed, so a scheme-less
+  loopback value like `127.0.0.1:18999` silently published every skill on every
+  interface, on a port the operator never chose — with nothing logged. A path, a
+  trailing slash or a missing port failed to bind with an address-parse error
+  naming neither the URL nor the cause.
+
+  **Breaking**: `APCoreA2AConfig` gains two fields, so struct-literal
+  construction must be updated (use `APCoreA2AConfig::default()` with `..`, or
+  the builder's new `.host()` / `.port()` / `.bind()` setters).
+
+- Rust now emits the unauthenticated-public-bind warning Python and TypeScript
+  already did — the one configuration that most deserves a line in the log
+  produced none.
+
 ## [0.5.0] - 2026-08-17
 
 Minor release. Task isolation moves into the `TaskStore`, which makes it survive

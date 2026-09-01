@@ -31,6 +31,9 @@ pub struct ApCoreAgentExecutor {
     executor: Arc<ApcoreExecutor>,
     part_converter: PartConverter,
     execution_timeout_secs: u64,
+    /// Whether a governance refusal forwards apcore's own reason instead of the
+    /// fixed per-class string (srs FR-ERR-011). Default off.
+    disclose_refusal_reason: bool,
 }
 
 impl ApCoreAgentExecutor {
@@ -43,7 +46,24 @@ impl ApCoreAgentExecutor {
             executor,
             part_converter,
             execution_timeout_secs,
+            disclose_refusal_reason: false,
         }
+    }
+
+    /// Forward apcore's own reason for a governance refusal (srs FR-ERR-011).
+    ///
+    /// Off by default. A server whose callers are its own agents wants the
+    /// reason — it is what the apcore MCP binding reports today; a server facing
+    /// untrusted callers keeps the default. The refusal's *class* is conveyed
+    /// either way; only the detail moves.
+    #[must_use]
+    pub fn with_disclose_refusal_reason(mut self, disclose: bool) -> Self {
+        self.disclose_refusal_reason = disclose;
+        self
+    }
+
+    pub fn disclose_refusal_reason(&self) -> bool {
+        self.disclose_refusal_reason
     }
 
     pub fn part_converter(&self) -> &PartConverter {

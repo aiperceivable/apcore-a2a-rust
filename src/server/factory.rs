@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -19,8 +21,8 @@ use crate::auth::middleware::AuthMiddlewareLayer;
 use crate::auth::protocol::Authenticator;
 use crate::server::executor::ApCoreAgentExecutor;
 use crate::server::handlers::{
-    explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler, AppState, AuthIdentity,
-    FilteredCard,
+    self, explorer_card as explorer_card_handler, explorer_html, jsonrpc_handler, AppState,
+    AuthIdentity, FilteredCard,
 };
 use crate::storage::{InMemoryPushConfigStore, InMemoryTaskStore, PushConfigStore, TaskStore};
 
@@ -142,8 +144,14 @@ impl A2AServerFactory {
             streaming: true,
             push_notifications: false,
             extensions: vec![],
-            // Extended agent card is offered when an authenticator is configured
-            // (Python/TS parity: extended_agent_card = auth is not None).
+            // Advertised only when this binding actually serves it
+            // (srs FR-AGC-006). With an `Authenticator` configured, the
+            // `GetExtendedAgentCard` method and the
+            // `/agent/authenticatedExtendedCard` route are both wired below, so
+            // the flag and the behaviour agree. Without one, the endpoint 404s
+            // and this stays `false` — a client is entitled to read the flag and
+            // call the method (A2A §3.2.x), so advertising an unserved
+            // capability is worse than not advertising it.
             extended_agent_card: auth.is_some(),
         };
 
@@ -158,6 +166,39 @@ impl A2AServerFactory {
         );
 
         let card_value = serde_json::to_value(&agent_card).unwrap();
+
+        // Skills whose module is annotated `requires_approval` are withheld from
+        // the public card (srs FR-AGC-003) and restored on the extended one
+        // (srs FR-AGC-004). Resolved once from the registry: an annotation
+        // cannot change for the life of a descriptor.
+        let approval_gated: HashSet<String> = agent_card
+            .skills
+            .iter()
+            .filter(|skill| {
+                registry
+                    .get_definition(&skill.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|def| def.annotations)
+                    .is_some_and(|ann| ann.requires_approval)
+            })
+            .map(|skill| skill.id.clone())
+            .collect();
+
+        // The public card is filtered for the anonymous principal once, here,
+        // rather than per request on an auth-exempt route.
+        let public_card_value = Arc::new(handlers::public_card(
+            &card_value,
+            &executor,
+            &approval_gated,
+        ));
+
+        // The extended card carries the full skill set, filtered per
+        // authenticated identity at request time. Absent without an
+        // authenticator, matching `capabilities.extendedAgentCard`.
+        let extended_card = auth
+            .is_some()
+            .then(|| Arc::new(FilteredCard::new(Arc::new(card_value.clone()))));
 
         // Explorer card: agent card enriched with per-skill input schemas.
         let explorer_card = {
@@ -197,7 +238,8 @@ impl A2AServerFactory {
             task_store,
             skill_ids: Arc::new(skill_ids),
             input_schemas: Arc::new(input_schemas),
-            agent_card: Arc::new(FilteredCard::new(Arc::new(card_value))),
+            agent_card: public_card_value,
+            extended_card,
             explorer_card,
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
             push_config_store,
@@ -209,7 +251,11 @@ impl A2AServerFactory {
             .route("/health", get(health))
             // A2A 1.0 primary discovery path + 0.3 compat alias.
             .route("/.well-known/agent-card.json", get(serve_card))
-            .route("/.well-known/agent.json", get(serve_card));
+            .route("/.well-known/agent.json", get(serve_card))
+            // srs FR-AGC-004. Deliberately absent from the auth-exempt list
+            // below, so an unauthenticated request is rejected by the middleware
+            // rather than by this handler.
+            .route("/agent/authenticatedExtendedCard", get(serve_extended_card));
 
         // Explorer UI (opt-in) at the configured prefix.
         if explorer {
@@ -241,17 +287,26 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "healthy" }))
 }
 
-async fn serve_card(
+async fn serve_card(State(state): State<AppState>) -> Json<Value> {
+    handlers::public_agent_card(State(state)).await
+}
+
+/// `GET /agent/authenticatedExtendedCard` (srs FR-AGC-004).
+///
+/// 404 when no `Authenticator` is configured, which is the same condition under
+/// which `capabilities.extendedAgentCard` is `false`.
+async fn serve_extended_card(
     State(state): State<AppState>,
     AuthIdentity(identity): AuthIdentity,
-) -> Json<Value> {
-    Json(
-        state
-            .agent_card
-            .for_caller(&state.executor, identity.as_ref())
-            .as_ref()
-            .clone(),
-    )
+) -> Response {
+    match handlers::extended_agent_card(&state, identity.as_ref()) {
+        Some(card) => Json(card).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Extended agent card is not configured" })),
+        )
+            .into_response(),
+    }
 }
 
 fn register_a2a_namespace() {

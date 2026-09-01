@@ -21,7 +21,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Re-exports: core bridge
 pub use crate::apcore_a2a::{
-    async_serve, async_serve_with_auth, build_app, build_app_with_auth, serve,
+    async_serve, async_serve_with_auth, bind_addr, build_app, build_app_with_auth, serve,
 };
 pub use crate::apcore_a2a::{
     APCoreA2A, APCoreA2ABuilder, APCoreA2AConfig, APCoreA2AError, BackendSource,

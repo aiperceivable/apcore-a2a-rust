@@ -4,6 +4,7 @@
 //! for surface-facing fields (name / description / tags) and derives A2A
 //! input/output modes from the descriptor's JSON Schemas (Python/TS parity).
 
+use apcore::module::ModuleAnnotations;
 use apcore::registry::ModuleDescriptor;
 use serde_json::Value;
 
@@ -66,7 +67,7 @@ impl SkillMapper {
         }
 
         // tags = display.tags (when non-empty) else descriptor.tags
-        let tags = display
+        let mut tags = display
             .get("tags")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -76,6 +77,7 @@ impl SkillMapper {
             })
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| descriptor.tags.clone());
+        append_annotation_tags(&mut tags, descriptor);
 
         AgentSkill {
             id: module_id.to_string(),
@@ -124,6 +126,46 @@ impl SkillMapper {
             .filter(|ex| !ex.title.is_empty())
             .map(|ex| ex.title.clone())
             .collect()
+    }
+}
+
+/// The four behavioral annotations promoted onto the A2A wire, with the tag
+/// each becomes. Order is fixed so the card is byte-identical across the three
+/// bindings (srs FR-SKL-004 criterion 8).
+type AnnotationFlag = fn(&ModuleAnnotations) -> bool;
+
+const ANNOTATION_TAGS: [(&str, AnnotationFlag); 4] = [
+    ("apcore:readonly", |a| a.readonly),
+    ("apcore:destructive", |a| a.destructive),
+    ("apcore:idempotent", |a| a.idempotent),
+    ("apcore:requires-approval", |a| a.requires_approval),
+];
+
+/// Append apcore's behavioral annotations to a skill's tags (srs FR-SKL-004).
+///
+/// A2A 1.0 `AgentSkill` is `{id, name, description, tags, examples, inputModes,
+/// outputModes, securityRequirements}` — no `extensions`, no `metadata` — so
+/// `tags` is the only carrier that exists. The `apcore:` prefix keeps these out
+/// of the module's own flat tag namespace, where a user tag named `destructive`
+/// would otherwise be indistinguishable from the annotation.
+///
+/// Without this the Agent Card carried enough for a caller to *construct* a call
+/// and not enough to judge whether making it is safe. It is also what makes
+/// retry semantics usable: `retryable` is a property of the error, but whether a
+/// retry is safe is a property of the operation, and a timeout is retryable for
+/// a read and dangerous for a non-idempotent mutation.
+///
+/// Only `true` flags are emitted, matching how the apcore MCP binding maps the
+/// same annotations onto optional `readOnlyHint` / `destructiveHint` /
+/// `idempotentHint`. Absence means "not asserted", never "asserted false".
+fn append_annotation_tags(tags: &mut Vec<String>, descriptor: &ModuleDescriptor) {
+    let Some(annotations) = descriptor.annotations.as_ref() else {
+        return;
+    };
+    for (tag, is_set) in ANNOTATION_TAGS {
+        if is_set(annotations) && !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
     }
 }
 

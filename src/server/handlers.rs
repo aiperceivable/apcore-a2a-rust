@@ -51,8 +51,18 @@ pub struct AppState {
     /// Per-skill input schema, so an inbound `TextPart` can be parsed against
     /// the schema the module actually declares.
     pub(crate) input_schemas: Arc<HashMap<String, Value>>,
-    pub(crate) agent_card: Arc<FilteredCard>,
+    /// The **public** card served at `/.well-known/*`, already filtered for the
+    /// anonymous principal at build time (srs FR-AGC-003). Filtering once rather
+    /// than per request is what keeps an auth-exempt route from letting any
+    /// anonymous client drive one governance audit write per skill per request.
+    pub(crate) agent_card: Arc<Value>,
+    /// The **extended** card (srs FR-AGC-004), filtered per authenticated
+    /// identity. `None` when no `Authenticator` is configured, which is also
+    /// when `capabilities.extendedAgentCard` is `false`.
+    pub(crate) extended_card: Option<Arc<FilteredCard>>,
     /// Agent card enriched with per-skill `_inputSchemas` for the Explorer UI.
+    /// Filtered per caller like the extended card: the Explorer sits behind the
+    /// auth middleware whenever one is configured.
     pub(crate) explorer_card: Arc<FilteredCard>,
     pub(crate) cancel_tokens: Arc<Mutex<HashMap<String, CancelToken>>>,
     /// Per-task push-notification webhook configs
@@ -69,6 +79,27 @@ pub async fn explorer_html() -> Html<&'static str> {
     Html(EXPLORER_HTML)
 }
 
+/// Serve the public Agent Card (srs FR-AGC-003).
+///
+/// Already filtered for the anonymous principal at build time, so this is a
+/// memory read — no `ACL::check`, no audit write, no per-caller cache lookup.
+pub async fn public_agent_card(State(state): State<AppState>) -> Json<Value> {
+    Json(state.agent_card.as_ref().clone())
+}
+
+/// Serve the extended Agent Card for the authenticated caller (srs FR-AGC-004).
+///
+/// Returns `None` when no `Authenticator` is configured, which is exactly when
+/// `capabilities.extendedAgentCard` is `false` — a binding serves every
+/// capability it advertises and advertises none it does not serve
+/// (srs FR-AGC-006).
+pub(crate) fn extended_agent_card(state: &AppState, identity: Option<&Identity>) -> Option<Value> {
+    state
+        .extended_card
+        .as_ref()
+        .map(|card| card.for_caller(&state.executor, identity).as_ref().clone())
+}
+
 /// Serve the Explorer's agent card (with `_inputSchemas`).
 pub async fn explorer_card(
     State(state): State<AppState>,
@@ -83,15 +114,19 @@ pub async fn explorer_card(
     )
 }
 
-/// Remove from a card the skills the caller is not allowed to invoke.
+/// Remove from a card the skills `identity` is not allowed to invoke.
 ///
 /// The ACL gated the call but not the advertisement, so a deny-all-but-one ACL
 /// still listed every module — telling a caller about capabilities it will
 /// always be refused, and disclosing the module inventory of a locked-down
-/// deployment. This is the same masking principle as srs FR-ERR-003, applied to
-/// discovery: what a caller may not invoke, it is not told about.
+/// deployment. apcore's ACL is the authority on who may invoke what, and the
+/// discovery surface reflects that authority rather than ignoring it.
 ///
-/// No ACL configured is the common case and costs nothing: the cached card is
+/// Called with `identity = None` once at build time to produce the **public**
+/// card (srs FR-AGC-003), and per authenticated identity to produce the
+/// **extended** card (srs FR-AGC-004).
+///
+/// No ACL configured is the common case and costs nothing: the card is
 /// returned as-is.
 ///
 /// The filter and the enforcement path must reach the *same* verdict, or the
@@ -119,10 +154,28 @@ pub async fn explorer_card(
 /// carried in `identity` and reaches the ACL through the context passed here,
 /// so `@system` and the `identity_types` / `roles` conditions discriminate
 /// callers on both surfaces.
+///
+/// Authorization and approval are two independent results, not one (apcore
+/// PROTOCOL_SPEC §6.1.6), and this reads them apart. `ACL::check` folds them
+/// into a boolean that **fails closed** on an approval requirement — correct for
+/// a caller about to execute, wrong for a discovery surface, where it would
+/// delete a skill from the extended card for the one reason FR-AGC-004 says to
+/// keep it. `ACL::check_access` carries both axes: `is_allowed()` decides
+/// visibility, and `approval_required` decides only whether the public card is
+/// the right surface, which is what `hide_approval_gated` selects.
+///
+/// The projection argument is `None`, because a card is discovery and there is
+/// no call site yet. An `arguments` condition (§6.1.7) is therefore unevaluable,
+/// so a rule carrying one neither denies nor grants — but an `allow` rule's
+/// `approval: required` stays *pending* and composes with whatever grants
+/// (§6.1.1 rule 5). A skill gated only for some argument shapes thus reports
+/// `approval_required` here: at discovery time "this may need approval" is the
+/// honest answer, and it is the one that keeps such a skill off the public card.
 fn acl_filtered_card(
     card: &Value,
     executor: &ApCoreAgentExecutor,
     identity: Option<&Identity>,
+    hide_approval_gated: bool,
 ) -> Value {
     let Some(acl) = executor.acl() else {
         return card.clone();
@@ -134,8 +187,90 @@ fn acl_filtered_card(
         skills.retain(|skill| {
             skill.get("id").and_then(Value::as_str).is_some_and(|id| {
                 let ctx = base.child(id);
-                acl.check(ctx.caller_id.as_deref(), id, Some(&ctx))
+                let decision = acl.check_access(ctx.caller_id.as_deref(), id, Some(&ctx), None);
+                decision.is_allowed() && !(hide_approval_gated && decision.approval_required)
             })
+        });
+    }
+    filtered
+}
+
+/// apcore's reserved namespace for the runtime's own management modules
+/// (apcore `PROTOCOL_SPEC` §6.7) — `system.health.*`, `system.usage.*`,
+/// `system.manifest.*` and, under the second opt-in, `system.control.*`. apcore
+/// identifies the surface by this prefix itself, in
+/// `Executor::governance_state`, so matching on it conveys apcore's own
+/// boundary rather than inventing one.
+pub(crate) const SYSTEM_NAMESPACE: &str = "system.";
+
+/// Whether `skill_id` is one of apcore's management modules.
+pub(crate) fn is_system_skill(skill_id: &str) -> bool {
+    skill_id.starts_with(SYSTEM_NAMESPACE)
+}
+
+/// Build the public Agent Card: what an **unauthenticated** caller could
+/// actually invoke (srs FR-AGC-003).
+///
+/// Four subtractions from the full card:
+///
+/// 1. skills in apcore's reserved `system.*` management namespace,
+/// 2. skills the ACL denies to the anonymous principal (`@external`),
+/// 3. skills the ACL allows that principal but gates behind a human
+///    (`approval: required`, apcore >= 0.28.0), and
+/// 4. skills whose module is annotated `requires_approval`.
+///
+/// 3 and 4 are the two sources PROTOCOL_SPEC §6.9 composes by **union**. Since
+/// apcore 0.28.0 the annotation is one source among several, so reading it alone
+/// would leave a skill on the public card that an anonymous caller cannot in
+/// fact just call.
+///
+/// 1 is the only subtraction that is **unconditional**, and the only one that
+/// still holds with no ACL configured — where 2 and 3 are empty and 4 covers
+/// just `system.control.*`, leaving the six read modules to publish the
+/// deployment's module inventory, health and usage to any anonymous caller
+/// (srs FR-AGC-003 criteria 12 and 13). `ACL::discover` yields `Ok(None)` for a
+/// missing root by design, so "no ACL at all" is the default rather than an edge
+/// case.
+///
+/// An approval gate is not a refusal — it is a prompt the caller can satisfy —
+/// so those skills reappear on the extended card, which is what gives
+/// `capabilities.extendedAgentCard` something to mean. `system.*` reappears
+/// there too (criterion 11), filtered by the ACL like any other skill: the
+/// namespace exclusion is a property of the public card, not of the skill.
+///
+/// This resolves exactly one identity, so it runs once at build time. A
+/// per-caller filter on `/.well-known/` would be strictly more accurate and
+/// unaffordable: that route is auth-exempt by design, so every anonymous request
+/// would drive `skills.len()` calls into the consumer's ACL audit sink.
+pub(crate) fn public_card(
+    card: &Value,
+    executor: &ApCoreAgentExecutor,
+    approval_gated: &HashSet<String>,
+) -> Value {
+    // The management namespace goes first and unconditionally, before the ACL is
+    // consulted at all: skipping the check for these ids also keeps `system.*`
+    // out of the audit trail of a decision whose answer cannot change the
+    // outcome.
+    let mut without_system = card.clone();
+    if let Some(skills) = without_system
+        .get_mut("skills")
+        .and_then(Value::as_array_mut)
+    {
+        skills.retain(|skill| {
+            !skill
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(is_system_skill)
+        });
+    }
+
+    let mut filtered = acl_filtered_card(&without_system, executor, None, true);
+    if let Some(skills) = filtered.get_mut("skills").and_then(Value::as_array_mut) {
+        skills.retain(|skill| {
+            !skill
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| approval_gated.contains(id))
         });
     }
     filtered
@@ -193,7 +328,7 @@ impl FilteredCard {
         if let Some(cached) = self.cache.lock().unwrap().get(&key) {
             return cached.clone();
         }
-        let filtered = Arc::new(acl_filtered_card(&self.card, executor, identity));
+        let filtered = Arc::new(acl_filtered_card(&self.card, executor, identity, false));
         let mut cache = self.cache.lock().unwrap();
         // A flat cap rather than an eviction order: entries are equivalent and
         // cheap to rebuild, so dropping the map is a fine way to stay bounded.
@@ -266,6 +401,10 @@ const CODE_INVALID_PARAMS: i32 = -32602;
 const CODE_TASK_NOT_FOUND: i32 = -32001;
 const CODE_TASK_NOT_CANCELABLE: i32 = -32002;
 const CODE_INTERNAL_ERROR: i32 = -32603;
+/// A2A 1.0 `ExtendedAgentCardNotConfiguredError`. Returned when a client calls
+/// `GetExtendedAgentCard` on a server with no `Authenticator` — the same server
+/// whose card reports `capabilities.extendedAgentCard = false`.
+const CODE_EXTENDED_CARD_NOT_CONFIGURED: i32 = -32007;
 
 /// Extract `metadata.skillId` from the JSON-RPC params.
 fn skill_id_of(params: &Value) -> Option<String> {
@@ -283,7 +422,11 @@ fn skill_id_of(params: &Value) -> Option<String> {
 }
 
 /// Map an apcore execution error to the resulting terminal task status.
-fn error_to_status(err: &ModuleError) -> TaskStatus {
+///
+/// This is the surface that matters most on `message/send`: that response is a
+/// JSON-RPC `result`, so the error *code* never reaches the caller at all —
+/// the state and this message are the entire payload it receives.
+fn error_to_status(err: &ModuleError, disclose_refusal_reason: bool) -> TaskStatus {
     match err.code {
         ErrorCode::ExecutionCancelled => TaskStatus::with_message(
             TaskState::Canceled,
@@ -296,7 +439,19 @@ fn error_to_status(err: &ModuleError) -> TaskStatus {
             TaskState::Failed,
             Message::agent_text("Execution timed out"),
         ),
-        _ => TaskStatus::with_message(TaskState::Failed, Message::agent_text(failure_text(err))),
+        // A2A 1.0 defines `rejected` as a terminal state, and a policy refusal
+        // is what it describes (srs FR-ERR-012). `failed` said only "something
+        // broke", which for a refusal is both wrong and an invitation to retry.
+        ErrorCode::ACLDenied | ErrorCode::ApprovalDenied | ErrorCode::ApprovalTimeout => {
+            TaskStatus::with_message(
+                TaskState::Rejected,
+                Message::agent_text(failure_text(err, disclose_refusal_reason)),
+            )
+        }
+        _ => TaskStatus::with_message(
+            TaskState::Failed,
+            Message::agent_text(failure_text(err, disclose_refusal_reason)),
+        ),
     }
 }
 
@@ -329,10 +484,13 @@ fn error_to_status(err: &ModuleError) -> TaskStatus {
 /// traceback-shaped lines, not module ids, versions, env-var names or
 /// hostnames). `user_fixable` is settable per-error by the module author, so
 /// any module could widen the fixed string further.
-fn failure_text(err: &ModuleError) -> String {
-    let message = ErrorMapper::to_jsonrpc_error(err).message;
+fn failure_text(err: &ModuleError, disclose_refusal_reason: bool) -> String {
+    let message = ErrorMapper::to_jsonrpc_error_with(err, disclose_refusal_reason).message;
     match err.ai_guidance.as_deref() {
-        Some(guidance) if carries_caller_detail(err) && !guidance.trim().is_empty() => {
+        Some(guidance)
+            if carries_caller_detail(err, disclose_refusal_reason)
+                && !guidance.trim().is_empty() =>
+        {
             format!("{message} ({})", sanitize_message(guidance))
         }
         _ => message,
@@ -442,6 +600,19 @@ pub async fn jsonrpc_handler(
         "ListTasks" => match handle_list(&state, &ctx).await {
             Ok(tasks) => Json(rpc_result(&id, json!({ "tasks": tasks }))).into_response(),
             Err((code, msg)) => Json(rpc_error(&id, code, &msg)).into_response(),
+        },
+        // srs FR-AGC-004 / FR-AGC-006. Previously this crate advertised
+        // `capabilities.extendedAgentCard` and dispatched nothing, so a client
+        // that read the flag and called the method — which A2A §3.2.x entitles
+        // it to do — got method-not-found.
+        "GetExtendedAgentCard" => match extended_agent_card(&state, identity.as_ref()) {
+            Some(card) => Json(rpc_result(&id, card)).into_response(),
+            None => Json(rpc_error(
+                &id,
+                CODE_EXTENDED_CARD_NOT_CONFIGURED,
+                "Extended agent card is not configured",
+            ))
+            .into_response(),
         },
         "tasks/pushNotificationConfig/set" => match handle_push_set(&state, &ctx, &params).await {
             Ok(v) => Json(rpc_result(&id, v)).into_response(),
@@ -677,7 +848,7 @@ async fn handle_send(
             task.status = TaskStatus::new(TaskState::Completed);
         }
         Err(err) => {
-            task.status = error_to_status(&err);
+            task.status = error_to_status(&err, state.executor.disclose_refusal_reason());
         }
     }
     let task_json = serde_json::to_value(&task).unwrap();
@@ -839,7 +1010,7 @@ async fn handle_stream(
 
         let final_status = match &error {
             None => TaskStatus::new(TaskState::Completed),
-            Some(e) => error_to_status(e),
+            Some(e) => error_to_status(e, state2.executor.disclose_refusal_reason()),
         };
         // Persist terminal task.
         let task = Task {
@@ -1203,7 +1374,7 @@ mod tests {
             ErrorCode::GeneralInternalError,
             "super secret internal detail leaking through",
         );
-        let status = error_to_status(&err);
+        let status = error_to_status(&err, false);
         assert_eq!(status.state, TaskState::Failed);
         assert_eq!(
             status_text(&status).as_deref(),
@@ -1212,19 +1383,78 @@ mod tests {
     }
 
     #[test]
-    fn acl_denied_stays_masked_as_task_not_found() {
-        // srs FR-ERR-003: an ACL denial must not disclose the caller, the target
-        // module, or that the denial happened at all.
+    fn acl_denial_is_rejected_not_failed_and_says_access_denied() {
+        // srs FR-ERR-003 / FR-ERR-012: the class of refusal reaches the caller,
+        // the detail does not. This is the surface that matters on
+        // `message/send`, where the JSON-RPC code never reaches the caller at
+        // all — the state and this message are the whole payload.
         let err = ModuleError::new(
             ErrorCode::ACLDenied,
             "caller alice denied module admin.wipe",
         );
-        let status = error_to_status(&err);
-        assert_eq!(status.state, TaskState::Failed);
+        let status = error_to_status(&err, false);
+        assert_eq!(status.state, TaskState::Rejected);
         let text = status_text(&status).unwrap();
-        assert_eq!(text, "Task not found");
+        assert_eq!(text, "Access denied");
+        // "Task not found" sent an agent back to retry the one thing that was
+        // fine. It must not come back.
+        assert_ne!(text, "Task not found");
         assert!(!text.contains("alice"));
         assert!(!text.contains("admin.wipe"));
+    }
+
+    #[test]
+    fn approval_refusals_are_rejected_not_failed() {
+        for (code, expected) in [
+            (ErrorCode::ApprovalDenied, "Approval denied"),
+            (ErrorCode::ApprovalTimeout, "Approval timed out"),
+        ] {
+            let err = ModuleError::new(code, "approval 7f3c1e for alice@example.com");
+            let status = error_to_status(&err, false);
+            assert_eq!(status.state, TaskState::Rejected, "{code:?}");
+            let text = status_text(&status).unwrap();
+            assert_eq!(text, expected);
+            // Not the retryable catch-all these used to land on.
+            assert_ne!(text, "Internal server error");
+            assert!(!text.contains("alice@example.com"), "{code:?}");
+            assert!(!text.contains("7f3c1e"), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn approval_pending_stays_a_resumable_pause() {
+        // The one approval code that must NOT move: it carries the approval_id
+        // the caller resumes with, and `rejected` is terminal.
+        let err = ModuleError::new(
+            ErrorCode::ApprovalPending,
+            "Approval required: approval_id=7f3c1e",
+        );
+        let status = error_to_status(&err, false);
+        assert_eq!(status.state, TaskState::InputRequired);
+        assert_eq!(
+            status_text(&status).as_deref(),
+            Some("Approval required: approval_id=7f3c1e"),
+            "the message must reach the caller verbatim"
+        );
+    }
+
+    #[test]
+    fn disclose_refusal_reason_reaches_the_task_status_surface() {
+        // The flag must move both surfaces together, or the JSON-RPC error and
+        // the task status would disagree about the same refusal.
+        let err = ModuleError::new(
+            ErrorCode::ACLDenied,
+            "caller alice denied module admin.wipe",
+        );
+        let status = error_to_status(&err, true);
+        assert_eq!(
+            status.state,
+            TaskState::Rejected,
+            "the flag must not move the state"
+        );
+        let text = status_text(&status).unwrap();
+        assert!(text.contains("alice"));
+        assert!(text.contains("admin.wipe"));
     }
 
     #[test]
@@ -1236,7 +1466,7 @@ mod tests {
             ErrorCode::GeneralInvalidInput,
             "Parameters '1' and 'l' cannot be used together",
         );
-        let status = error_to_status(&err);
+        let status = error_to_status(&err, false);
         assert_eq!(status.state, TaskState::Failed);
         let text = status_text(&status).unwrap();
         assert!(
@@ -1248,7 +1478,7 @@ mod tests {
     #[test]
     fn schema_validation_error_names_the_field() {
         let err = ModuleError::new(ErrorCode::SchemaValidationError, "width: must be integer");
-        let text = status_text(&error_to_status(&err)).unwrap();
+        let text = status_text(&error_to_status(&err, false)).unwrap();
         assert!(text.contains("width"), "{text}");
     }
 
@@ -1258,7 +1488,7 @@ mod tests {
         // sees only this status message, so it is appended there.
         let err = ModuleError::new(ErrorCode::GeneralInvalidInput, "bad flag combination")
             .with_ai_guidance("send either -1 or -l, not both");
-        let text = status_text(&error_to_status(&err)).unwrap();
+        let text = status_text(&error_to_status(&err, false)).unwrap();
         assert!(text.contains("send either -1 or -l, not both"), "{text}");
     }
 
@@ -1278,7 +1508,7 @@ mod tests {
         );
         assert_eq!(err.user_fixable, Some(true), "precondition for this test");
         assert_eq!(
-            status_text(&error_to_status(&err)).as_deref(),
+            status_text(&error_to_status(&err, false)).as_deref(),
             Some("Internal server error")
         );
 
@@ -1287,7 +1517,7 @@ mod tests {
         let internal = ModuleError::new(ErrorCode::GeneralInternalError, "boom")
             .with_ai_guidance("inspect /var/log/secret.log");
         assert_eq!(
-            status_text(&error_to_status(&internal)).as_deref(),
+            status_text(&error_to_status(&internal, false)).as_deref(),
             Some("Internal server error")
         );
     }
@@ -1296,13 +1526,14 @@ mod tests {
     fn ai_guidance_is_withheld_when_a_module_declares_a_masked_error_user_fixable() {
         // `user_fixable` is author-settable, so gating on it let any module
         // widen a fixed per-class string. An ACL denial must stay exactly
-        // "Task not found" (srs FR-ERR-003) whatever the module claims.
+        // "Access denied" (srs FR-ERR-003) whatever the module claims — the
+        // guidance here names the very module the refusal must not disclose.
         let err = ModuleError::new(ErrorCode::ACLDenied, "caller alice denied admin.wipe")
             .with_user_fixable(true)
             .with_ai_guidance("ask an admin to grant you the 'admin.wipe' role");
         assert_eq!(
-            status_text(&error_to_status(&err)).as_deref(),
-            Some("Task not found")
+            status_text(&error_to_status(&err, false)).as_deref(),
+            Some("Access denied")
         );
     }
 
@@ -1310,7 +1541,7 @@ mod tests {
     fn timeout_error_keeps_specific_message() {
         // The specific arms are unchanged: timeout still maps to its own message.
         let err = ModuleError::new(ErrorCode::ModuleTimeout, "ignored");
-        let status = error_to_status(&err);
+        let status = error_to_status(&err, false);
         assert_eq!(status.state, TaskState::Failed);
         assert_eq!(status_text(&status).as_deref(), Some("Execution timed out"));
     }

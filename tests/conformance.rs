@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use apcore::context::Context;
 use apcore::errors::{ErrorCode, ModuleError};
-use apcore::module::Module;
+use apcore::module::{Module, ModuleAnnotations};
 use apcore::registry::registry::Registry;
 use apcore_a2a::adapters::agent_card::AgentCapabilities;
 use apcore_a2a::auth::protocol::Authenticator;
@@ -119,6 +119,8 @@ fn str_list(v: &Value) -> Vec<String> {
 struct EchoModule {
     description: String,
     schema: Value,
+    tags: Vec<String>,
+    annotations: ModuleAnnotations,
 }
 
 #[async_trait]
@@ -131,6 +133,12 @@ impl Module for EchoModule {
     }
     fn description(&self) -> &str {
         &self.description
+    }
+    fn tags(&self) -> Vec<String> {
+        self.tags.clone()
+    }
+    fn annotations(&self) -> ModuleAnnotations {
+        self.annotations.clone()
     }
     async fn execute(&self, inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
         Ok(inputs)
@@ -177,6 +185,26 @@ fn echo(desc: &str) -> Box<dyn Module> {
     Box::new(EchoModule {
         description: desc.into(),
         schema: json!({ "type": "object" }),
+        tags: vec![],
+        annotations: ModuleAnnotations::default(),
+    })
+}
+
+/// An echo module carrying the `tags` and `annotations` a card fixture declares.
+fn echo_from_fixture(spec: &Value) -> Box<dyn Module> {
+    let mut annotations = ModuleAnnotations::default();
+    if let Some(ann) = spec.get("annotations") {
+        let flag = |key: &str| ann.get(key).and_then(Value::as_bool).unwrap_or(false);
+        annotations.readonly = flag("readonly");
+        annotations.destructive = flag("destructive");
+        annotations.idempotent = flag("idempotent");
+        annotations.requires_approval = flag("requires_approval");
+    }
+    Box::new(EchoModule {
+        description: spec["description"].as_str().unwrap_or("").to_string(),
+        schema: json!({ "type": "object" }),
+        tags: str_list(&spec["tags"]),
+        annotations,
     })
 }
 
@@ -280,6 +308,11 @@ fn conformance_error_mapping() {
     };
     for case in arr(&fixture, "error_cases") {
         let id = case["id"].as_str().unwrap();
+        // Cases about the server's tasks/* path are not reconstructible as an
+        // apcore exception; the task-scoping tests assert those.
+        if case["surface"].as_str() == Some("server") {
+            continue;
+        }
         let spec = &case["input"];
         let name = spec["exception"].as_str().unwrap();
         let (code, message) = match name {
@@ -294,6 +327,18 @@ fn conformance_error_mapping() {
             "ACLDeniedError" => (
                 ErrorCode::ACLDenied,
                 format!("caller {} module {}", spec["caller"], spec["module"]),
+            ),
+            "ApprovalDeniedError" => (
+                ErrorCode::ApprovalDenied,
+                spec["message"].as_str().unwrap_or("denied").to_string(),
+            ),
+            "ApprovalTimeoutError" => (
+                ErrorCode::ApprovalTimeout,
+                spec["message"].as_str().unwrap_or("timed out").to_string(),
+            ),
+            "ApprovalPendingError" => (
+                ErrorCode::ApprovalPending,
+                spec["message"].as_str().unwrap_or("pending").to_string(),
             ),
             // ModuleExecuteError and unknown exceptions both hit the catch-all arm.
             _ => (
@@ -490,13 +535,17 @@ fn conformance_agent_card() {
     for case in arr(&fixture, "test_cases") {
         let id = case["id"].as_str().unwrap();
         let spec = &case["input"];
+        // Cases carrying `card_variant` / `acl_rules` / `identity` exercise the
+        // serve() layer (the anonymous-principal filter needs the executor's
+        // ACL), not `AgentCardBuilder::build`. `card_visibility.rs` asserts
+        // those against a real router.
+        if spec.get("card_variant").is_some() {
+            continue;
+        }
         let registry = Registry::new();
         for m in arr(spec, "modules") {
             registry
-                .register_module(
-                    m["module_id"].as_str().unwrap(),
-                    echo(m["description"].as_str().unwrap()),
-                )
+                .register_module(m["module_id"].as_str().unwrap(), echo_from_fixture(m))
                 .expect("register module");
         }
         let builder = AgentCardBuilder::new(SkillMapper::new());
@@ -527,6 +576,33 @@ fn conformance_agent_card() {
         }
         if let Some(n) = case["expected_skill_count"].as_u64() {
             assert_eq!(arr(&actual, "skills").len() as u64, n, "[{id}] skill count");
+        }
+        // srs FR-SKL-004: apcore's behavioral annotations reach the wire as
+        // namespaced tags, in a fixed order, after the module's own tags.
+        if let Some(expected_tags) = case["expected_skill_tags"].as_object() {
+            for (skill_id, tags) in expected_tags {
+                let skill = arr(&actual, "skills")
+                    .iter()
+                    .find(|s| s["id"].as_str() == Some(skill_id.as_str()))
+                    .unwrap_or_else(|| panic!("[{id}] no skill {skill_id:?} on the card"));
+                assert_eq!(
+                    str_list(&skill["tags"]),
+                    str_list(tags),
+                    "[{id}] tags for {skill_id}"
+                );
+            }
+        }
+        if let Some(expected_ids) = case.get("expected_skill_ids") {
+            // Sorted on both sides: which skills appear is the contract,
+            // the order the registry enumerates them in is not.
+            let mut actual_ids: Vec<String> = arr(&actual, "skills")
+                .iter()
+                .filter_map(|s| s["id"].as_str().map(str::to_string))
+                .collect();
+            actual_ids.sort();
+            let mut expected = str_list(expected_ids);
+            expected.sort();
+            assert_eq!(actual_ids, expected, "[{id}] skill ids");
         }
         if case["expected_security_requirements_empty"] == json!(true) {
             assert!(

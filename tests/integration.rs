@@ -229,6 +229,7 @@ async fn agent_card_advertises_only_acl_allowed_skills() {
             callers: vec!["*".into()],
             targets: vec!["test.echo".into()],
             effect: "allow".into(),
+            approval: None,
             description: None,
             conditions: None,
         }],
@@ -949,13 +950,7 @@ async fn task_reads_are_scoped_to_the_authenticated_principal() {
 }
 
 /// Fetch the Agent Card as the principal behind `bearer` and return its skill ids.
-async fn advertised_skills(router: axum::Router, bearer: &str) -> Vec<String> {
-    let req = Request::builder()
-        .uri("/.well-known/agent-card.json")
-        .header("authorization", format!("Bearer {bearer}"))
-        .body(Body::empty())
-        .unwrap();
-    let card = body_json(router.oneshot(req).await.unwrap()).await;
+fn skill_ids(card: &Value) -> Vec<String> {
     card["skills"]
         .as_array()
         .expect("skills array")
@@ -964,12 +959,34 @@ async fn advertised_skills(router: axum::Router, bearer: &str) -> Vec<String> {
         .collect()
 }
 
+/// Skills the **extended** card advertises to `bearer`'s principal
+/// (srs FR-AGC-004). This is the per-caller surface; the public card is
+/// resolved once for the anonymous principal and does not vary by bearer.
+async fn advertised_skills(router: axum::Router, bearer: &str) -> Vec<String> {
+    let req = Request::builder()
+        .uri("/agent/authenticatedExtendedCard")
+        .header("authorization", format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    skill_ids(&body_json(router.oneshot(req).await.unwrap()).await)
+}
+
+/// Skills the **public** card advertises (srs FR-AGC-003) — no credentials,
+/// resolved for the anonymous principal at build time.
+async fn public_skills(router: axum::Router) -> Vec<String> {
+    let req = Request::builder()
+        .uri("/.well-known/agent-card.json")
+        .body(Body::empty())
+        .unwrap();
+    skill_ids(&body_json(router.oneshot(req).await.unwrap()).await)
+}
+
 /// Whether `bearer`'s principal can actually invoke `skill_id`.
 ///
-/// An ACL denial reaches the caller as a FAILED task masked with the same
-/// "Task not found" string a missing task gets (srs FR-ERR-003), which is
-/// exactly what distinguishes "refused by the ACL" from "ran and failed"
-/// (`test.guard` fails with an invalid-input message, not this one).
+/// An ACL denial reaches the caller as a REJECTED task carrying the fixed
+/// "Access denied" string (srs FR-ERR-003 / FR-ERR-012), which is exactly what
+/// distinguishes "refused by the ACL" from "ran and failed" (`test.guard` fails
+/// with an invalid-input message, not this one).
 async fn is_callable(router: axum::Router, bearer: &str, skill_id: &str) -> bool {
     let sent = post_rpc_as(
         router,
@@ -987,7 +1004,7 @@ async fn is_callable(router: axum::Router, bearer: &str, skill_id: &str) -> bool
         .as_str()
         .unwrap_or_default()
         .to_string();
-    text != "Task not found"
+    text != "Access denied"
 }
 
 #[tokio::test]
@@ -1017,6 +1034,7 @@ async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
             callers: callers.iter().map(|c| (*c).to_string()).collect(),
             targets: targets.iter().map(|t| (*t).to_string()).collect(),
             effect: effect.to_string(),
+            approval: None,
             description: None,
             conditions,
         };
@@ -1058,6 +1076,16 @@ async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
     .await
     .expect("build app with auth");
 
+    // The public card answers "what may anyone call". Nothing, here: rule 1
+    // denies two skills to `@external` outright, and rule 3's `identity_types`
+    // condition cannot match a caller with no identity, so the default `deny`
+    // takes the rest. Before this became the contract, Python and TypeScript
+    // published all four to any anonymous caller.
+    assert!(
+        public_skills(app.clone()).await.is_empty(),
+        "the public card must not advertise what an anonymous caller cannot invoke"
+    );
+
     let all_skills = ["test.echo", "test.guard", "test.internal", "test.slow"];
     for principal in ["good", "weak"] {
         let advertised = advertised_skills(app.clone(), principal).await;
@@ -1084,6 +1112,394 @@ async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
 }
 
 #[tokio::test]
+async fn an_acl_approval_gate_hides_a_skill_from_the_public_card_only() {
+    // apcore 0.28.0 (PROTOCOL_SPEC §6.1.6) lets an ACL rule require a human
+    // without denying the call, and §6.9 composes that with the module
+    // annotation by union. A skill the operator gated that way is not something
+    // an anonymous caller can just call, so it leaves the public card exactly as
+    // an annotated one does — and it stays on the extended card, because the
+    // caller *is* authorized: the gate is a prompt they can satisfy, not a
+    // refusal. The call itself then meets apcore's approval gate, which is what
+    // `APPROVAL_PENDING` -> `input_required` already reports.
+    //
+    // The regression this pins is the fold: `ACL::check` collapses the two axes
+    // and returns false for allow-with-approval, so a filter written against the
+    // boolean would delete the skill from BOTH cards, reporting a refusal the
+    // ACL never issued.
+    use apcore::acl::{ACLRule, ApprovalRequirement, ACL};
+    use apcore::config::Config;
+    use apcore::executor::Executor;
+
+    let acl = ACL::new(
+        vec![
+            ACLRule {
+                callers: vec!["*".into()],
+                targets: vec!["test.guard".into()],
+                effect: "allow".into(),
+                approval: Some(ApprovalRequirement::Required),
+                description: None,
+                conditions: None,
+            },
+            ACLRule {
+                callers: vec!["*".into()],
+                targets: vec!["*".into()],
+                effect: "allow".into(),
+                approval: None,
+                description: None,
+                conditions: None,
+            },
+        ],
+        "deny",
+        None,
+    );
+    let mut executor = Executor::new(echo_registry(), Config::default());
+    executor.set_acl(acl);
+
+    let (app, _card) = apcore_a2a::build_app_with_auth(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+        Some(Arc::new(TestAuth)),
+    )
+    .await
+    .expect("build app with auth");
+
+    let mut public = public_skills(app.clone()).await;
+    public.sort();
+    assert_eq!(
+        public,
+        vec![
+            "test.echo".to_string(),
+            "test.internal".to_string(),
+            "test.slow".to_string()
+        ],
+        "an ACL-gated skill must leave the public card"
+    );
+
+    let mut extended = advertised_skills(app, "good").await;
+    extended.sort();
+    assert_eq!(
+        extended,
+        vec![
+            "test.echo".to_string(),
+            "test.guard".to_string(),
+            "test.internal".to_string(),
+            "test.slow".to_string()
+        ],
+        "the extended card must keep a skill the caller may reach behind a human"
+    );
+}
+
+/// A registry carrying apcore's real management namespace beside a user module,
+/// with `sys_modules.events` on so the three `system.control.*` write modules are
+/// registered too.
+///
+/// The modules are registered by apcore itself rather than hand-rolled: this
+/// crate's `Registry::register_module` rejects the id outright
+/// (`InvalidModuleId: Module ID contains reserved word: 'system'`), so apcore's
+/// own registration is the only way the namespace can reach a registry — which
+/// is also why the visibility rule can key on the prefix without fear of a user
+/// module colliding with it.
+fn system_namespace_executor(
+    acl: Option<apcore::acl::ACL>,
+) -> (Arc<Registry>, apcore::executor::Executor) {
+    use apcore::config::Config;
+    use apcore::executor::Executor;
+
+    let registry = Registry::new();
+    registry
+        .register_module("test.echo", Box::new(EchoModule))
+        .expect("register echo module");
+    let registry = Arc::new(registry);
+
+    let mut executor = Executor::new(registry.clone(), Config::default());
+    if let Some(acl) = acl {
+        executor.set_acl(acl);
+    }
+
+    let mut sys_config = Config::default();
+    sys_config.set("sys_modules.enabled", json!(true));
+    sys_config.set("sys_modules.events.enabled", json!(true));
+    apcore::register_sys_modules(registry.clone(), &executor, &sys_config, None)
+        .expect("register apcore system modules");
+
+    (registry, executor)
+}
+
+/// Every `tracing` message emitted while `f` runs, joined by newline.
+///
+/// Uses `tracing::subscriber::set_default`, which is **thread-local** — not
+/// `set_global_default` — so this cannot race the other tests in this binary,
+/// and `#[tokio::test]` builds a current-thread runtime, so the emitting code
+/// stays on the thread the guard covers. That is what makes asserting a log
+/// line affordable here; without it srs FR-AGC-007 criterion 2 would be the one
+/// requirement this crate states and never checks.
+async fn captured_logs<F, T>(f: F) -> (T, String)
+where
+    F: std::future::Future<Output = T>,
+{
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
+
+    #[derive(Default)]
+    struct Message(String);
+    impl Visit for Message {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    struct Capture(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
+            let mut message = Message::default();
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::Registry::default().with(Capture(seen.clone()));
+    let guard = tracing::subscriber::set_default(subscriber);
+    let out = f.await;
+    drop(guard);
+    let text = seen.lock().unwrap().join("\n");
+    (out, text)
+}
+
+fn system_ids(registry: &Registry) -> Vec<String> {
+    let mut ids = registry.list(None, Some("system."), None);
+    ids.sort();
+    ids
+}
+
+fn allow_all_acl(targets: &str, effect: &str) -> apcore::acl::ACL {
+    use apcore::acl::{ACLRule, ACL};
+    ACL::new(
+        vec![ACLRule {
+            callers: vec!["*".into()],
+            targets: vec![targets.into()],
+            effect: effect.into(),
+            approval: None,
+            description: None,
+            conditions: None,
+        }],
+        "allow",
+        None,
+    )
+}
+
+#[tokio::test]
+async fn public_card_excludes_the_system_namespace_with_no_acl() {
+    // srs FR-AGC-003 criteria 12 and 13 — the case both ACL-shaped rules leave
+    // open. With no ACL the ACL predicates are empty and the annotation covers
+    // only `system.control.*`, so without the namespace rule the read modules
+    // would publish the deployment's module inventory and health to any
+    // anonymous caller on the auth-exempt `/.well-known/` route. This crate
+    // returned the card unfiltered in that state (`handlers.rs`: `let Some(acl)
+    // = executor.acl() else { return card.clone() }`).
+    let (registry, executor) = system_namespace_executor(None);
+    assert!(!system_ids(&registry).is_empty(), "precondition");
+
+    let (app, _card) = apcore_a2a::build_app(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+    )
+    .await
+    .expect("build app");
+
+    assert_eq!(public_skills(app).await, vec!["test.echo".to_string()]);
+}
+
+#[tokio::test]
+async fn public_card_excludes_the_system_namespace_even_when_the_acl_allows_it() {
+    // The subtraction is unconditional, not a consequence of the ACL denying
+    // them: an ACL that explicitly allows everything must not put them back.
+    let (_registry, executor) = system_namespace_executor(Some(allow_all_acl("*", "allow")));
+
+    let (app, _card) = apcore_a2a::build_app(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+    )
+    .await
+    .expect("build app");
+
+    assert_eq!(public_skills(app).await, vec!["test.echo".to_string()]);
+}
+
+#[tokio::test]
+async fn extended_card_keeps_the_system_namespace() {
+    // srs FR-AGC-004 criterion 11. The exclusion is a property of the public
+    // card, not of the skill — an authenticated management agent the ACL permits
+    // must still be able to discover the surface it may drive. The
+    // `system.control.*` modules are present because `requires_approval` keeps a
+    // skill on the extended card (criterion 2), so this also shows the two rules
+    // composing rather than one masking the other.
+    let (registry, executor) = system_namespace_executor(None);
+    let registered = system_ids(&registry);
+
+    let (app, _card) = apcore_a2a::build_app_with_auth(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+        Some(Arc::new(TestAuth)),
+    )
+    .await
+    .expect("build app with auth");
+
+    let extended = advertised_skills(app, "good").await;
+    for id in &registered {
+        assert!(
+            extended.contains(id),
+            "the extended card must carry {id}, got {extended:?}"
+        );
+    }
+    assert!(
+        registered
+            .iter()
+            .any(|id| id.starts_with("system.control.")),
+        "precondition: sys_modules.events must have registered the write modules"
+    );
+    assert!(extended.contains(&"test.echo".to_string()));
+}
+
+#[tokio::test]
+async fn an_unprotected_control_surface_warns_without_refusing_to_start() {
+    // srs FR-AGC-007 criteria 1, 2 and 4: the message is emitted, the server
+    // still starts, and neither card changes.
+    //
+    // The condition is real: `system.control.*` declares `requires_approval`,
+    // but apcore's approval gate warns once and continues when no
+    // `ApprovalHandler` is configured, so withholding the namespace from the
+    // card removes it from discovery and not from dispatch.
+    let (_registry, executor) = system_namespace_executor(None);
+    assert!(
+        executor.governance_state().unprotected_control_surface,
+        "precondition: control modules registered with no gate engaging"
+    );
+
+    let (built, logged) = captured_logs(apcore_a2a::build_app(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+    ))
+    .await;
+    let (app, _card) =
+        built.expect("an unprotected control surface must warn, never refuse to start");
+
+    assert!(
+        logged.contains("system.control"),
+        "the warning must name the control surface; logged: {logged:?}"
+    );
+    assert!(
+        logged.contains("remain callable"),
+        "the warning must say the modules are still callable; logged: {logged:?}"
+    );
+    assert_eq!(public_skills(app).await, vec!["test.echo".to_string()]);
+}
+
+#[tokio::test]
+async fn a_gated_control_surface_does_not_warn() {
+    // srs FR-AGC-007 criterion 3. A diagnostic that fires when the operator HAS
+    // configured governance is one nobody reads.
+    let (_registry, executor) = system_namespace_executor(Some(allow_all_acl("*", "allow")));
+    assert!(
+        !executor.governance_state().unprotected_control_surface,
+        "precondition: an ACL is attached and the gate is wired"
+    );
+
+    let (built, logged) = captured_logs(apcore_a2a::build_app(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+    ))
+    .await;
+    let (_app, _card) = built.expect("build app");
+
+    assert!(
+        !logged.contains("remain callable"),
+        "no control-surface warning was due; logged: {logged:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_system_namespace_is_still_subject_to_the_acl_on_the_extended_card() {
+    // Keeping the namespace off the public card must not exempt it from the ACL
+    // on the surface where the ACL does apply.
+    let (_registry, executor) = system_namespace_executor(Some(allow_all_acl("system.*", "deny")));
+
+    let (app, _card) = apcore_a2a::build_app_with_auth(
+        BackendSource::Executor(Arc::new(executor)),
+        APCoreA2AConfig::default(),
+        Some(Arc::new(TestAuth)),
+    )
+    .await
+    .expect("build app with auth");
+
+    assert_eq!(
+        advertised_skills(app, "good").await,
+        vec!["test.echo".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn sys_modules_true_actually_registers_the_system_modules() {
+    // apcore-a2a#5: this crate passed `Config::default()` to
+    // `register_sys_modules`, which reads `sys_modules.enabled` and returns an
+    // empty context when it is absent — and `let _ =` swallowed the fact. So the
+    // flag was a silent no-op, and the visibility rule above had nothing to act
+    // on. Both are fixed together: repairing this alone is what would have
+    // opened the hole.
+    let registry = echo_registry();
+    let config = APCoreA2AConfig {
+        sys_modules: true,
+        ..Default::default()
+    };
+    let (app, _card) = apcore_a2a::build_app(BackendSource::Registry(registry.clone()), config)
+        .await
+        .expect("build app");
+
+    let mut system: Vec<String> = registry.list(None, Some("system."), None);
+    system.sort();
+    assert!(
+        !system.is_empty(),
+        "sys_modules = true must register apcore's system.* modules"
+    );
+    assert!(system.iter().any(|id| id.starts_with("system.health.")));
+
+    // And none of them reaches the public card (srs FR-AGC-003 criterion 12).
+    let public = public_skills(app).await;
+    assert!(
+        !public.iter().any(|id| id.starts_with("system.")),
+        "registered system modules must stay off the public card, got {public:?}"
+    );
+}
+
+#[tokio::test]
+async fn sys_modules_false_registers_nothing() {
+    // The other half of apcore-a2a#5: the flag was a no-op in BOTH directions,
+    // and a suite that only ever asserts the `true` case cannot tell "off" from
+    // "broken". The public card cannot carry this assertion — the namespace rule
+    // would hide a leaked module anyway — so it is made against the registry.
+    let registry = echo_registry();
+    let (_app, _card) = apcore_a2a::build_app(
+        BackendSource::Registry(registry.clone()),
+        APCoreA2AConfig::default(),
+    )
+    .await
+    .expect("build app");
+
+    assert!(
+        !APCoreA2AConfig::default().sys_modules,
+        "precondition: the default is opt-out"
+    );
+    assert!(
+        system_ids(&registry).is_empty(),
+        "sys_modules = false must register nothing, got {:?}",
+        system_ids(&registry)
+    );
+}
+
+#[tokio::test]
 async fn agent_card_filter_does_not_re_drive_the_acl_audit_sink() {
     // `/.well-known/agent-card.json` is auth-exempt and the filter runs
     // `ACL::check` per skill, each of which calls the consumer's audit sink —
@@ -1103,6 +1519,7 @@ async fn agent_card_filter_does_not_re_drive_the_acl_audit_sink() {
             callers: vec!["*".into()],
             targets: vec!["test.echo".into()],
             effect: "allow".into(),
+            approval: None,
             description: None,
             conditions: None,
         }],
@@ -1645,4 +2062,217 @@ async fn a_persistent_push_config_store_keeps_its_scoping_across_a_restart() {
     )
     .await;
     assert_eq!(other_get["error"]["code"], -32001);
+}
+
+// ---------------------------------------------------------------------------
+// Agent Card visibility (srs FR-AGC-003 / FR-AGC-004 / FR-AGC-006)
+// ---------------------------------------------------------------------------
+
+/// A module the operator has gated behind human approval.
+struct ApprovalGatedModule;
+
+#[async_trait]
+impl Module for ApprovalGatedModule {
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn output_schema(&self) -> Value {
+        json!({ "type": "object" })
+    }
+    fn description(&self) -> &str {
+        "Deletes a user"
+    }
+    fn annotations(&self) -> apcore::module::ModuleAnnotations {
+        apcore::module::ModuleAnnotations {
+            requires_approval: true,
+            destructive: true,
+            ..Default::default()
+        }
+    }
+    async fn execute(&self, inputs: Value, _ctx: &Context<Value>) -> Result<Value, ModuleError> {
+        Ok(inputs)
+    }
+}
+
+fn gated_registry() -> Arc<Registry> {
+    let registry = Registry::new();
+    registry
+        .register_module("test.echo", Box::new(EchoModule))
+        .expect("register echo module");
+    registry
+        .register_module("admin.users.delete", Box::new(ApprovalGatedModule))
+        .expect("register gated module");
+    Arc::new(registry)
+}
+
+#[tokio::test]
+async fn public_card_withholds_approval_gated_skills_even_without_an_acl() {
+    // srs FR-AGC-003 criterion 7. An approval gate is an operator saying "a
+    // human decides each of these", which is not something to advertise to
+    // anonymous callers — and withholding it is what leaves the extended card
+    // with something to carry.
+    let (app, _card) = apcore_a2a::build_app(
+        BackendSource::Registry(gated_registry()),
+        APCoreA2AConfig::default(),
+    )
+    .await
+    .expect("build app");
+
+    assert_eq!(public_skills(app).await, vec!["test.echo".to_string()]);
+}
+
+#[tokio::test]
+async fn extended_card_restores_approval_gated_skills_for_an_authenticated_caller() {
+    // srs FR-AGC-004 criterion 2 and criterion 9: the extended card is not a
+    // copy of the public one. Python used to return `CopyFrom(base_card)` and
+    // this crate did not route the endpoint at all.
+    let (app, _card) = apcore_a2a::build_app_with_auth(
+        BackendSource::Registry(gated_registry()),
+        APCoreA2AConfig::default(),
+        Some(Arc::new(TestAuth)),
+    )
+    .await
+    .expect("build app with auth");
+
+    let public = public_skills(app.clone()).await;
+    let mut extended = advertised_skills(app, "good").await;
+    extended.sort();
+    assert_eq!(public, vec!["test.echo".to_string()]);
+    assert_eq!(
+        extended,
+        vec!["admin.users.delete".to_string(), "test.echo".to_string()]
+    );
+    assert_ne!(public, extended, "the extended card must not be a copy");
+}
+
+#[tokio::test]
+async fn extended_card_capability_and_endpoint_agree() {
+    // srs FR-AGC-006. Advertising a capability this crate does not serve is
+    // worse than not advertising it: a client cannot tell "no extra skills
+    // exist" from "this server is broken".
+    let (app, card) = apcore_a2a::build_app(
+        BackendSource::Registry(gated_registry()),
+        APCoreA2AConfig::default(),
+    )
+    .await
+    .expect("build app");
+    assert!(!card.capabilities.extended_agent_card);
+
+    // Not advertised, so both surfaces refuse rather than half-answering.
+    let req = Request::builder()
+        .uri("/agent/authenticatedExtendedCard")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+
+    let (_status, rpc) = post_rpc(
+        app,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard", "params": {}}),
+    )
+    .await;
+    assert_eq!(rpc["error"]["code"], json!(-32007));
+
+    let (app, card) = apcore_a2a::build_app_with_auth(
+        BackendSource::Registry(gated_registry()),
+        APCoreA2AConfig::default(),
+        Some(Arc::new(TestAuth)),
+    )
+    .await
+    .expect("build app with auth");
+    assert!(card.capabilities.extended_agent_card);
+
+    // Advertised, so the RPC method a client is entitled to call answers.
+    let rpc = post_rpc_as(
+        app,
+        "good",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "GetExtendedAgentCard", "params": {}}),
+    )
+    .await;
+    assert_eq!(skill_ids(&rpc["result"]).len(), 2);
+}
+
+#[tokio::test]
+async fn behavioral_annotations_reach_the_agent_card_as_namespaced_tags() {
+    // srs FR-SKL-004. Before this, a caller could construct a call to
+    // `admin.users.delete` from the card and had nothing on the card telling it
+    // the call was destructive.
+    let (app, _card) = apcore_a2a::build_app_with_auth(
+        BackendSource::Registry(gated_registry()),
+        APCoreA2AConfig::default(),
+        Some(Arc::new(TestAuth)),
+    )
+    .await
+    .expect("build app with auth");
+
+    let req = Request::builder()
+        .uri("/agent/authenticatedExtendedCard")
+        .header("authorization", "Bearer good")
+        .body(Body::empty())
+        .unwrap();
+    let card = body_json(app.oneshot(req).await.unwrap()).await;
+    let gated = card["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == json!("admin.users.delete"))
+        .expect("gated skill on the extended card");
+    let tags: Vec<&str> = gated["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    // Fixed order, and only the flags that are actually set.
+    assert_eq!(tags, vec!["apcore:destructive", "apcore:requires-approval"]);
+    assert!(!tags.contains(&"apcore:readonly"));
+    assert!(!tags.contains(&"apcore:idempotent"));
+}
+
+// ---------------------------------------------------------------------------
+// Bind address (apcore-a2a-rust#2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_agent_card_url_is_derived_from_host_and_port_when_unset() {
+    // `url` is what the card publishes; `host`/`port` are what the server
+    // binds. Conflating them is what let a scheme-less `url` silently bind
+    // 0.0.0.0:8000. An empty `url` means "derive", as Python documents.
+    let config = APCoreA2AConfig {
+        host: "127.0.0.1".to_string(),
+        port: 18999,
+        url: String::new(),
+        ..Default::default()
+    };
+    let (_app, card) = apcore_a2a::build_app(BackendSource::Registry(echo_registry()), config)
+        .await
+        .expect("build app");
+    assert_eq!(
+        card.supported_interfaces[0].url, "http://127.0.0.1:18999",
+        "the published endpoint must be resolvable"
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_bind_is_never_widened_to_every_interface() {
+    // The old code split `url` on "://" and fell back to 0.0.0.0:8000, so a
+    // scheme-less loopback value published every skill on every interface with
+    // nothing logged. `host`/`port` are typed, so that is not expressible: the
+    // card's `url` can say anything at all without moving the bind.
+    let config = APCoreA2AConfig {
+        host: "127.0.0.1".to_string(),
+        port: 18999,
+        // Deliberately the shape that used to trigger the fallback.
+        url: "127.0.0.1:18999".to_string(),
+        ..Default::default()
+    };
+    let addr: String = apcore_a2a::bind_addr(&config).expect("bind address");
+    assert_eq!(addr, "127.0.0.1:18999");
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
+    let bound = listener.local_addr().unwrap();
+    assert_eq!(bound.ip().to_string(), "127.0.0.1");
+    assert_eq!(bound.port(), 18999);
+    assert!(!bound.ip().is_unspecified(), "must never become 0.0.0.0");
 }
