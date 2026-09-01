@@ -173,6 +173,18 @@ impl ApCoreAgentExecutor {
     /// non-cooperative module cannot block indefinitely. On elapse a
     /// `ModuleTimeout` error is returned (surfaced as a failed "Execution timed
     /// out" status, matching Python/TS).
+    //
+    // `clippy::result_large_err` (184 bytes) fires on apcore's `ModuleError`,
+    // not on anything this crate declares — the type is byte-identical in
+    // apcore 0.27 and 0.28, and the lint only began flagging it in clippy 1.98.
+    // Boxing it is the lint's suggested fix and the wrong one here: this method
+    // forwards `apcore::Executor::call`, whose signature is
+    // `Result<Value, ModuleError>`, so a `Box` would make every caller unwrap an
+    // indirection apcore does not have, to move an allocation onto an error path
+    // that is already the slow one. Allowed at the one site rather than raised
+    // repo-wide in `clippy.toml`, so a genuinely oversized error of our own
+    // still trips it.
+    #[allow(clippy::result_large_err)]
     pub async fn call(
         &self,
         module_id: &str,
