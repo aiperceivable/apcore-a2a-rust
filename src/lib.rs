@@ -8,6 +8,8 @@ pub mod auth;
 pub mod cli;
 pub mod client;
 pub mod explorer;
+#[cfg(feature = "openapi")]
+pub mod openapi_backend;
 pub mod server;
 pub mod storage;
 pub mod types;
@@ -50,3 +52,10 @@ pub use crate::adapters::{
 
 // Re-exports: client
 pub use crate::client::{A2AClient, A2AClientError, AgentCardFetcher, ClientResult};
+
+// Re-exports: OpenAPI backend (feature `openapi`)
+#[cfg(feature = "openapi")]
+pub use crate::openapi_backend::{
+    build_openapi_backend_from_config, openapi_backend, openapi_backend_from_spec,
+    project_module_id, resolve_spec_location, synthesize_description, OpenAPIBackendOptions,
+};

@@ -244,15 +244,32 @@ async fn collect_sse(router: axum::Router, body: Value) -> Vec<Value> {
 // Coverage guard
 // ---------------------------------------------------------------------------
 
-/// Every fixture in the spec repo that this file claims to drive.
+/// Every fixture in the spec repo that this crate claims to drive.
+///
+/// All but one are driven by this file. `openapi_backend.json` is driven by
+/// `tests/openapi_backend_conformance.rs`, because the whole backend sits behind
+/// the `openapi` cargo feature and its driver has to be gated with it — but the
+/// guard below still refuses to let the *file* go undriven, and the second
+/// assertion below refuses to let the driver go missing.
 const DRIVEN_FIXTURES: &[&str] = &[
     "agent_card.json",
     "error_mapping.json",
     "jwt_claim_coercion.json",
+    // Driven by tests/openapi_backend_conformance.rs (feature `openapi`).
+    "openapi_backend.json",
     "part_conversion.json",
     "skill_resolution.json",
     "streaming_events.json",
 ];
+
+/// Fixtures driven from another test binary, and the file that drives each.
+///
+/// Listing a name in `DRIVEN_FIXTURES` is a claim; for a fixture this file does
+/// not itself load, the claim is checked by requiring the driver to exist.
+const EXTERNAL_DRIVERS: &[(&str, &str)] = &[(
+    "openapi_backend.json",
+    "tests/openapi_backend_conformance.rs",
+)];
 
 #[test]
 fn every_spec_fixture_has_a_driver() {
@@ -295,6 +312,15 @@ fn every_spec_fixture_has_a_driver() {
         "DRIVEN_FIXTURES names fixture(s) the spec repo no longer has: {missing:?} \
          — the driver for each is skipping every case"
     );
+
+    // A fixture delegated to another binary must actually have that binary.
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for (fixture, driver) in EXTERNAL_DRIVERS {
+        assert!(
+            crate_dir.join(driver).is_file(),
+            "{fixture} is listed as driven by {driver}, which does not exist"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

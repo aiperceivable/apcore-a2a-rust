@@ -309,7 +309,9 @@ async fn serve_extended_card(
     }
 }
 
-fn register_a2a_namespace() {
+/// Register the `apcore-a2a` config namespace. Idempotent, and shared with the
+/// CLI, which reads `apcore-a2a.openapi` before any factory exists.
+pub(crate) fn register_a2a_namespace() {
     use apcore::config::{Config, EnvStyle, NamespaceRegistration};
     let _ = Config::register_namespace(NamespaceRegistration {
         name: "apcore-a2a".to_string(),
@@ -320,6 +322,22 @@ fn register_a2a_namespace() {
             "explorer": false,
             "metrics": false,
             "push_notifications": false,
+            // OpenAPI backend (feature F-12) — {spec, base_url, prefix, include,
+            // exclude, include_deprecated, timeout, headers,
+            // acknowledge_unapproved_writes}. The first NESTED section in a
+            // namespace whose five other keys are all scalars.
+            //
+            // `spec` is also the first path-typed key here, and apcore 0.30.0's
+            // protections for path-typed keys do not reach it:
+            // `Config::path_typed_keys()` is a hardcoded set of apcore's own five
+            // keys and never consults a namespace registered through
+            // `Config::register_namespace` (verified against apcore 0.30.0), and
+            // the PROTOCOL_SPEC §9.2.1 requirement-5 empty-value discard is gated
+            // on that same set — so `APCORE_A2A_OPENAPI_SPEC=` would arrive as an
+            // ordinary override to "", a legal relative path to every filesystem
+            // API and never the one an operator meant.
+            // `openapi_backend::resolve_spec_location` owns the three rules instead.
+            "openapi": null,
         })),
         schema: None,
         env_style: EnvStyle::default(),

@@ -1,6 +1,6 @@
 //! APCoreA2A — central orchestrator and builder.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -22,12 +22,36 @@ pub enum APCoreA2AError {
     EmptyRegistry,
     #[error("server error: {0}")]
     Server(String),
+    /// A misconfiguration detected before the server can start — a missing
+    /// `prefix` in a mixed deployment, an unresolvable spec location, a document
+    /// that is not OpenAPI 3.0.x/3.1.x, no usable base URL, or a derived module
+    /// ID colliding with one already in the registry. Distinct from
+    /// [`Self::Server`] because none of these are runtime failures: the operator
+    /// changes a config key and starts again.
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
 pub enum BackendSource {
     ExtensionsDir(PathBuf),
     Registry(Arc<Registry>),
     Executor(Arc<Executor>),
+    /// An OpenAPI 3.0/3.1 document: every operation becomes an A2A Skill,
+    /// proxied over HTTP to the API that published the document, with no apcore
+    /// project on the other end (feature F-12).
+    ///
+    /// `spec` is a URL or a filesystem path, resolved per FR-OAS-004 — see
+    /// [`crate::openapi_backend::resolve_spec_location`].
+    ///
+    /// `options` is boxed: it is by far the widest thing this enum carries (a
+    /// dozen configuration fields and three hook slots), and inlining it would
+    /// make every `BackendSource` — including the three that hold a single
+    /// pointer — that size.
+    #[cfg(feature = "openapi")]
+    OpenApi {
+        spec: String,
+        options: Box<crate::openapi_backend::OpenAPIBackendOptions>,
+    },
 }
 
 impl From<&str> for BackendSource {
@@ -182,7 +206,7 @@ impl APCoreA2A {
 /// A [`Discoverer`] that carries its own filesystem roots. `Registry::discover`
 /// invokes the discoverer with empty roots ("use defaults"); this wrapper
 /// substitutes the roots configured on the [`BackendSource::ExtensionsDir`].
-struct RootedDiscoverer {
+pub(crate) struct RootedDiscoverer {
     inner: apcore::registry::DefaultDiscoverer,
     roots: Vec<String>,
 }
@@ -197,6 +221,25 @@ impl apcore::registry::Discoverer for RootedDiscoverer {
     }
 }
 
+/// Discover apcore modules from an extensions directory into a fresh
+/// [`Registry`].
+///
+/// Shared with the CLI so that a *mixed* deployment — an extensions directory
+/// plus an OpenAPI document — populates one registry through the same discovery
+/// path `BackendSource::ExtensionsDir` uses, rather than a second copy of it.
+pub(crate) async fn discover_extensions(path: &Path) -> Result<Arc<Registry>, APCoreA2AError> {
+    let registry = Arc::new(Registry::new());
+    let discoverer = RootedDiscoverer {
+        inner: apcore::registry::DefaultDiscoverer::new(),
+        roots: vec![path.to_string_lossy().to_string()],
+    };
+    registry
+        .discover(&discoverer)
+        .await
+        .map_err(|e| APCoreA2AError::Server(e.to_string()))?;
+    Ok(registry)
+}
+
 /// Resolve a [`BackendSource`] into an apcore [`Executor`] and, when available,
 /// the shared `Arc<Registry>` (needed to register `sys.*` modules). The pure
 /// `Executor` backend owns its registry internally, so no handle is returned.
@@ -205,15 +248,7 @@ async fn resolve_backend(
 ) -> Result<(Arc<Executor>, Option<Arc<Registry>>), APCoreA2AError> {
     match source {
         BackendSource::ExtensionsDir(path) => {
-            let registry = Arc::new(Registry::new());
-            let discoverer = RootedDiscoverer {
-                inner: apcore::registry::DefaultDiscoverer::new(),
-                roots: vec![path.to_string_lossy().to_string()],
-            };
-            registry
-                .discover(&discoverer)
-                .await
-                .map_err(|e| APCoreA2AError::Server(e.to_string()))?;
+            let registry = discover_extensions(&path).await?;
             let executor = Arc::new(Executor::new(registry.clone(), Config::default()));
             Ok((executor, Some(registry)))
         }
@@ -222,6 +257,25 @@ async fn resolve_backend(
             Ok((executor, Some(registry)))
         }
         BackendSource::Executor(executor) => Ok((executor, None)),
+        #[cfg(feature = "openapi")]
+        BackendSource::OpenApi { spec, options } => {
+            // The registry is populated BEFORE the executor is constructed, so
+            // the executor never observes a half-built module set.
+            let registry = crate::openapi_backend::openapi_backend_from_spec(
+                &spec,
+                Arc::new(Registry::new()),
+                *options,
+            )
+            .await?;
+            let executor = Arc::new(Executor::new(registry.clone(), Config::default()));
+            // The owned `Arc<Registry>` is returned rather than `None` because
+            // `apcore::register_sys_modules` takes an owned `Arc<Registry>`
+            // while `Executor::registry()` yields only a `&Registry`. Returning
+            // `None` here would silently cost `system.*` registration on an
+            // OpenAPI-backed server — the feature spec's whole reason for making
+            // this source produce a `Registry` rather than an `Executor`.
+            Ok((executor, Some(registry)))
+        }
     }
 }
 

@@ -29,7 +29,8 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 - **Built-in client** — `A2AClient` for calling remote A2A agents
 - **SSE streaming** — `message/stream` server-sent events; `A2AClient::stream_message` on the client
 - **Push notifications** — `tasks/pushNotificationConfig/{set,get,delete}` with webhook delivery
-- **CLI support** — `apcore-a2a --extensions-dir ./extensions` for zero-code startup
+- **OpenAPI backend** (cargo feature `openapi`) — point it at an OpenAPI 3.0/3.1 document and every operation becomes an A2A Skill, proxied over HTTP, with no apcore project on the other end
+- **CLI support** — `apcore-a2a --extensions-dir ./extensions` (or `--from-openapi <url|path>`, or an `apcore-a2a.openapi.spec` in your apcore config) for zero-code startup
 - **Pluggable storage** — `TaskStore` / `PushConfigStore` traits for custom backends, owner-scoped per call
 - **Observability** — `/health` endpoint
 - **Config Bus** — registers `apcore-a2a` namespace with `APCORE_A2A` env prefix (apcore 0.22)
@@ -40,8 +41,8 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 ## Requirements
 
 - Rust edition 2021
-- `apcore` 0.22
-- `apcore-toolkit` 0.8
+- `apcore` >= 0.30
+- `apcore-toolkit` >= 0.11.1
 
 ---
 
@@ -51,7 +52,12 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 
 ```toml
 [dependencies]
-apcore-a2a = "0.4"
+apcore-a2a = "0.7"
+
+# Or, to serve an OpenAPI document instead of (or alongside) an extensions
+# directory. The feature pulls in apcore-toolkit's `http-proxy` support, which
+# is what fetches the spec and registers each operation as an HTTP proxy.
+apcore-a2a = { version = "0.7", features = ["openapi"] }
 ```
 
 ### Expose your modules as an A2A Agent
@@ -68,6 +74,40 @@ async fn main() {
     apcore_a2a::serve(source, config).await.unwrap();
 }
 ```
+
+### Serve an OpenAPI document instead
+
+No apcore project required. Build with `--features openapi`, then either name the document on
+the command line:
+
+```bash
+apcore-a2a --from-openapi https://petstore3.swagger.io/api/v3/openapi.json \
+           --openapi-prefix petstore
+```
+
+...or declare it in your apcore config and run `apcore-a2a` with no flags at all:
+
+```yaml
+apcore-a2a:
+  openapi:
+    spec: ./openapi.json          # URL, or a path relative to Config::project_root
+    prefix: petstore
+    include_deprecated: false
+    timeout: 30.0                 # spec-fetch timeout; Config-Bus only, no flag
+    headers:                      # spec fetch only, never sent on proxied calls
+      X-Api-Key: "${PETSTORE_SPEC_KEY}"
+```
+
+Precedence is per key, and an explicit flag wins: `--openapi-prefix zoo` above overrides
+`prefix` and leaves `spec`, `include_deprecated`, `timeout` and `headers` exactly as
+configured. `timeout`, `include`, `exclude` and `acknowledge_unapproved_writes` have no flag
+in any of the three SDKs and are set through the Config Bus only.
+
+> **Warning:** an OpenAPI document describes an API's *shape*, not the *consequences* of
+> calling it, so `requires_approval` is never inferred — a `POST /charges` that moves money is
+> annotated exactly like a `POST /echo`, and is therefore advertised on the **public** Agent
+> Card, which is served without authentication. apcore-a2a warns about this at startup, and
+> the warning is not silenced by merely attaching an ACL.
 
 ### Call a remote A2A Agent
 

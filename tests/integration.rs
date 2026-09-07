@@ -225,14 +225,11 @@ async fn agent_card_advertises_only_acl_allowed_skills() {
     use apcore::executor::Executor;
 
     let acl = ACL::new(
-        vec![ACLRule {
-            callers: vec!["*".into()],
-            targets: vec!["test.echo".into()],
-            effect: "allow".into(),
-            approval: None,
-            description: None,
-            conditions: None,
-        }],
+        vec![ACLRule::new(
+            vec!["*".into()],
+            vec!["test.echo".into()],
+            "allow",
+        )],
         "deny",
         None,
     );
@@ -1029,15 +1026,15 @@ async fn agent_card_filter_and_acl_enforcement_agree_for_the_same_principal() {
     use apcore::config::Config;
     use apcore::executor::Executor;
 
-    let rule =
-        |callers: &[&str], targets: &[&str], effect: &str, conditions: Option<Value>| ACLRule {
-            callers: callers.iter().map(|c| (*c).to_string()).collect(),
-            targets: targets.iter().map(|t| (*t).to_string()).collect(),
-            effect: effect.to_string(),
-            approval: None,
-            description: None,
-            conditions,
-        };
+    let rule = |callers: &[&str], targets: &[&str], effect: &str, conditions: Option<Value>| {
+        let mut rule = ACLRule::new(
+            callers.iter().map(|c| (*c).to_string()).collect(),
+            targets.iter().map(|t| (*t).to_string()).collect(),
+            effect,
+        );
+        rule.conditions = conditions;
+        rule
+    };
     let acl = ACL::new(
         vec![
             // 1. Two skills are off-limits to unauthenticated callers — which,
@@ -1130,24 +1127,12 @@ async fn an_acl_approval_gate_hides_a_skill_from_the_public_card_only() {
     use apcore::config::Config;
     use apcore::executor::Executor;
 
+    let mut guarded = ACLRule::new(vec!["*".into()], vec!["test.guard".into()], "allow");
+    guarded.approval = Some(ApprovalRequirement::Required);
     let acl = ACL::new(
         vec![
-            ACLRule {
-                callers: vec!["*".into()],
-                targets: vec!["test.guard".into()],
-                effect: "allow".into(),
-                approval: Some(ApprovalRequirement::Required),
-                description: None,
-                conditions: None,
-            },
-            ACLRule {
-                callers: vec!["*".into()],
-                targets: vec!["*".into()],
-                effect: "allow".into(),
-                approval: None,
-                description: None,
-                conditions: None,
-            },
+            guarded,
+            ACLRule::new(vec!["*".into()], vec!["*".into()], "allow"),
         ],
         "deny",
         None,
@@ -1278,14 +1263,7 @@ fn system_ids(registry: &Registry) -> Vec<String> {
 fn allow_all_acl(targets: &str, effect: &str) -> apcore::acl::ACL {
     use apcore::acl::{ACLRule, ACL};
     ACL::new(
-        vec![ACLRule {
-            callers: vec!["*".into()],
-            targets: vec![targets.into()],
-            effect: effect.into(),
-            approval: None,
-            description: None,
-            conditions: None,
-        }],
+        vec![ACLRule::new(vec!["*".into()], vec![targets.into()], effect)],
         "allow",
         None,
     )
@@ -1515,14 +1493,11 @@ async fn agent_card_filter_does_not_re_drive_the_acl_audit_sink() {
     let entries = Arc::new(AtomicUsize::new(0));
     let counter = entries.clone();
     let acl = ACL::new(
-        vec![ACLRule {
-            callers: vec!["*".into()],
-            targets: vec!["test.echo".into()],
-            effect: "allow".into(),
-            approval: None,
-            description: None,
-            conditions: None,
-        }],
+        vec![ACLRule::new(
+            vec!["*".into()],
+            vec!["test.echo".into()],
+            "allow",
+        )],
         "deny",
         Some(Arc::new(move |_: &AuditEntry| {
             counter.fetch_add(1, Ordering::SeqCst);
