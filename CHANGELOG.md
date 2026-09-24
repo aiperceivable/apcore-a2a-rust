@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-24
+
+Minor release, version-aligned with the Python and TypeScript SDKs. Raises the required floor to
+`apcore` 0.31.0 and `apcore-toolkit` 0.12.0, and fixes a card/enforcement divergence the floor
+raise would otherwise have reopened. 224 tests pass (was 224 — one test rewritten in place, no
+new surface).
+
+### Fixed
+
+- **`ApCoreAgentExecutor::acl_context` no longer synthesizes an `Identity` for an anonymous
+  caller** (`src/server/executor.rs`). This method exists to reproduce, out of pipeline, exactly
+  what apcore's `BuiltinContextCreation` hands to `BuiltinACLCheck`, so the Agent Card filter and
+  the real call path agree about what an anonymous caller can see. Through apcore 0.30, apcore-rust
+  itself manufactured an `Identity{id:"@external", type:"external"}` for a null identity — a
+  Rust-only bug apcore-python and apcore-typescript never had — and this method mirrored it for the
+  same reason it mirrors everything else `BuiltinContextCreation` does. apcore 0.31.0 fixes
+  apcore-rust to match its siblings (`PROTOCOL_SPEC` decision D-103: a null `identity` stays null,
+  no synthetic `@external` principal; `caller_id` alone still defaults to the ACL's `@external`
+  sentinel). Left unmirrored, this method would have kept manufacturing an `Identity` the real
+  pipeline no longer does, silently reopening the exact discovery/enforcement disagreement this
+  method was written to prevent: a `identity_types`/`roles` conditional ACL rule would evaluate
+  against a fabricated principal on the card path and against `None` on the call path. `caller_id`
+  defaulting is unaffected — only the `identity` synthesis was removed.
+
+### Changed — dependency floor
+
+- **Required `apcore` floor raised to 0.31.0** (was `>=0.30`) and **required `apcore-toolkit`
+  floor raised to 0.12.0** (was `>=0.11.1`). apcore 0.31.0 is two joined audit cycles
+  (`PROTOCOL_SPEC` v1.37.0 → v1.59.0) settling 54 cross-language divergences, five of them
+  security defects; apcore-toolkit 0.12.0 adds the Device Authorization Flow (RFC 8628, unused
+  here), threads a `pattern` parameter through `BindingLoader.load` (not used by this crate), and
+  fixes a `$ref` sibling-key credential-disclosure defect in its own schema resolver. Every
+  `apcore`/`apcore-toolkit` symbol this crate imports was grepped against both changelogs'
+  breaking-change sections: the one hit is the `acl_context` fix above. `src/adapters/schema.rs`
+  delegates `$ref` resolution entirely to `apcore_toolkit::deep_resolve_refs`, so the toolkit's
+  sibling-key fix reaches this crate transitively with no code change needed here — unlike
+  `apcore-mcp`, which carried an independent, unfixed copy of the same bug in its own schema
+  converter. `sys_modules.enabled` registration, `global_deadline` construction (already a
+  dedicated `Context` field, already epoch seconds, already built fresh per request rather than
+  deserialized), and `governance_state()`/`check_access` usage were all checked against their
+  respective decisions and need no change.
+
 ## [0.7.0] - 2026-09-07
 
 Minor release, version-aligned with the Python and TypeScript SDKs. Ships the **OpenAPI

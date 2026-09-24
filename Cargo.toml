@@ -1,6 +1,6 @@
 [package]
 name = "apcore-a2a"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "A2A protocol adapter for apcore — expose apcore modules as A2A agents"
 license = "Apache-2.0"
@@ -26,12 +26,12 @@ default = []
 openapi = ["apcore-toolkit/http-proxy"]
 
 [dependencies]
-apcore = ">=0.30"
+apcore = ">=0.31"
 # `default-features = false` so `http-proxy` — a *default* feature of the
 # toolkit — is reached through this crate's `openapi` feature instead of being
 # enabled unconditionally. The unconditional import (`deep_resolve_refs`) is
 # outside that feature.
-apcore-toolkit = { version = ">=0.11.1", default-features = false }
+apcore-toolkit = { version = ">=0.12.0", default-features = false }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

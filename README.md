@@ -41,8 +41,8 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 ## Requirements
 
 - Rust edition 2021
-- `apcore` >= 0.30
-- `apcore-toolkit` >= 0.11.1
+- `apcore` >= 0.31
+- `apcore-toolkit` >= 0.12.0
 
 ---
 
@@ -52,12 +52,12 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 
 ```toml
 [dependencies]
-apcore-a2a = "0.7"
+apcore-a2a = "0.8"
 
 # Or, to serve an OpenAPI document instead of (or alongside) an extensions
 # directory. The feature pulls in apcore-toolkit's `http-proxy` support, which
 # is what fetches the spec and registers each operation as an HTTP proxy.
-apcore-a2a = { version = "0.7", features = ["openapi"] }
+apcore-a2a = { version = "0.8", features = ["openapi"] }
 ```
 
 ### Expose your modules as an A2A Agent

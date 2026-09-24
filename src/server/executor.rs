@@ -6,7 +6,6 @@
 //! `tasks/cancel`) and a `global_deadline` derived from `execution_timeout`
 //! (bounds both the single-shot and streaming paths).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -133,8 +132,13 @@ impl ApCoreAgentExecutor {
     /// the two things apcore's `BuiltinContextCreation` does to a top-level
     /// context before `BuiltinACLCheck` reads it:
     ///
-    /// 1. defaults a missing `caller_id` to `@external` and synthesizes a
-    ///    matching external `Identity`;
+    /// 1. defaults a missing `caller_id` to `@external`, the ACL's own
+    ///    sentinel for a null `caller_id` — `identity` itself is left
+    ///    untouched (apcore >= 0.31, `PROTOCOL_SPEC` decision D-103: "a null
+    ///    `identity` stays null", no synthetic `@external` principal — apcore
+    ///    0.30 and earlier manufactured one on the Rust side only, which this
+    ///    method used to mirror; apcore-python and apcore-typescript never
+    ///    did, and the Rust behaviour was the bug, not the contract);
     /// 2. replaces the context with `Context::child(module_id)`.
     ///
     /// Step 1 is applied here; step 2 is per-skill, so the caller applies
@@ -154,14 +158,6 @@ impl ApCoreAgentExecutor {
         let mut ctx = self.build_context(identity, CancelToken::new());
         if ctx.caller_id.is_none() {
             ctx.caller_id = Some(EXTERNAL_CALLER.to_string());
-            if ctx.identity.is_none() {
-                ctx.identity = Some(Identity::new(
-                    EXTERNAL_CALLER.to_string(),
-                    "external".to_string(),
-                    vec![],
-                    HashMap::new(),
-                ));
-            }
         }
         ctx
     }
@@ -257,6 +253,8 @@ impl ApCoreAgentExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use apcore::config::Config;
     use apcore::registry::registry::Registry;
 
@@ -326,16 +324,16 @@ mod tests {
     }
 
     #[test]
-    fn acl_context_synthesizes_the_external_identity_for_an_anonymous_caller() {
+    fn acl_context_defaults_caller_id_but_leaves_identity_null_for_an_anonymous_caller() {
+        // apcore >= 0.31, D-103: a null `identity` stays null — no synthetic
+        // `@external` principal. Only `caller_id` gets the ACL's sentinel
+        // default, matching apcore's own `BuiltinContextCreation` exactly, so
+        // this out-of-pipeline check agrees with the real enforcement path.
         let ctx = agent_executor().acl_context(None);
         assert_eq!(ctx.caller_id.as_deref(), Some(EXTERNAL_CALLER));
-        assert_eq!(
-            ctx.identity.as_ref().map(Identity::id),
-            Some(EXTERNAL_CALLER)
-        );
-        assert_eq!(
-            ctx.identity.as_ref().map(Identity::identity_type),
-            Some("external")
+        assert!(
+            ctx.identity.is_none(),
+            "identity must stay null, not be synthesized"
         );
     }
 }
