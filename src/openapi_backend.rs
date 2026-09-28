@@ -3,21 +3,30 @@
 //! Pipeline:
 //!
 //! ```text
-//! load_spec -> OpenAPIScanner::scan -> [repair] -> HTTPProxyRegistryWriter::write -> Registry
+//! load_spec -> OpenAPIScanner::scan -> [skip illegal IDs, repair descriptions]
+//!           -> HTTPProxyRegistryWriter::write -> Registry
 //! ```
 //!
 //! The scanner and the writer both live in apcore-toolkit; this module composes
-//! them and adds the two repairs the composition needs, neither of which the
-//! toolkit can make on its own:
+//! them and adds the two things the composition needs on top:
 //!
-//! * **FR-OAS-002 module-ID projection.** apcore-toolkit's `derive_module_id`
-//!   sanitizes into `[A-Za-z0-9_.-]`; apcore's registry accepts only
-//!   `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`. Without the projection the
-//!   canonical Swagger Petstore scans cleanly and registers nothing.
+//! * **FR-OAS-002 registry-legal module IDs.** apcore-toolkit >= 0.13.0 emits
+//!   every `module_id` in apcore's Canonical ID alphabet (camelCase split into
+//!   snake_case words, other characters replaced by `_`, a legal ID never
+//!   rewritten), after `base_path_prefix` and the hooks — so this module
+//!   registers the emitted ID unchanged. The one thing the toolkit will not
+//!   repair is a segment that begins with a digit (`/v1/2fa` -> `v1.2fa.get`):
+//!   such a module is skipped before the writer, with a WARNING naming the ID
+//!   and the segment.
 //! * **FR-OAS-003 description repair.** An operation carrying neither `summary`
 //!   nor `description` yields `""`, and [`AgentCardBuilder`] skips a module
 //!   whose description is empty or whitespace-only — so the operation would
 //!   vanish from the Agent Card with no diagnostic at all.
+//!
+//! Both run on the modules `scan` *returns* — after the caller's own
+//! `transform_module` hook, the toolkit's normalisation, its filters and its
+//! deduplication — so every diagnostic names the ID that actually reaches the
+//! Agent Card.
 //!
 //! See `apcore-a2a/docs/features/openapi-backend.md` for the specification and
 //! `conformance/fixtures/openapi_backend.json` for the shared contract.
@@ -26,7 +35,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use apcore::executor::GovernanceState;
 use apcore::registry::registry::Registry;
@@ -63,7 +72,8 @@ const PROXY_TIMEOUT_SECS: f64 = 60.0;
 ///
 /// apcore's registry enforces `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$` at
 /// `Registry::register_module` and again at `Executor::call`. This is that
-/// pattern, per segment, hand-rolled so the crate needs no regex for it.
+/// pattern, per segment, hand-rolled so the crate needs no regex for it. The
+/// FR-OAS-002 skip policy tests every segment of an emitted ID with it.
 #[must_use]
 pub fn is_legal_segment(segment: &str) -> bool {
     let mut chars = segment.chars();
@@ -80,8 +90,18 @@ pub fn is_legal_segment(segment: &str) -> bool {
 /// segment apcore would reject — `/v1/2fa` derives `v1.2fa.get`, and an apcore
 /// segment may not begin with a digit, so repairing it would mean *inventing* a
 /// character. That is a naming decision belonging to the operator's own
-/// `transform_module` hook, not to a silent default: the module is dropped and
-/// the caller reports it (FR-OAS-002).
+/// `transform_module` hook, not to a silent default.
+///
+/// Deprecated: apcore-toolkit >= 0.13 emits every module ID in apcore's
+/// Canonical ID alphabet itself, so this projection is no longer needed and
+/// [`openapi_backend`] no longer calls it. It does not reproduce the toolkit's
+/// naming — it lowercases without splitting words (`listPets` -> `listpets`,
+/// where the toolkit emits `list_pets`) — so do not use it to predict a
+/// registered ID.
+#[deprecated(
+    note = "apcore-toolkit >= 0.13 emits module IDs in apcore's Canonical ID alphabet, so this \
+            projection is no longer needed; it will be removed in a later minor release"
+)]
 #[must_use]
 pub fn project_module_id(module_id: &str) -> Option<String> {
     let candidate = module_id.to_ascii_lowercase().replace('-', "_");
@@ -95,14 +115,13 @@ pub fn project_module_id(module_id: &str) -> Option<String> {
     }
 }
 
-/// The first segment of a projected ID that apcore would still reject.
-fn offending_segment(module_id: &str) -> String {
-    let candidate = module_id.to_ascii_lowercase().replace('-', "_");
-    candidate
-        .split('.')
-        .find(|s| !is_legal_segment(s))
-        .unwrap_or(&candidate)
-        .to_string()
+/// The first segment of `module_id` apcore's registry would reject, if any.
+///
+/// Tested on the ID exactly as the scanner emitted it — never a projection of
+/// it. An empty ID yields the empty segment `""`, matching the toolkit's own
+/// legality warning.
+fn illegal_segment(module_id: &str) -> Option<&str> {
+    module_id.split('.').find(|s| !is_legal_segment(s))
 }
 
 /// Build a `{METHOD} {url_path}` description for an undocumented operation
@@ -281,11 +300,13 @@ pub struct OpenAPIBackendOptions {
     /// `builtin_approval_gate_wired` is `false` the approval gate is not in the
     /// running pipeline at all — and never suppresses it.
     pub governance_state: Option<GovernanceState>,
-    /// The caller's own per-operation hook. Runs **first**, before the
-    /// description repair and the ID projection, so the two invariants those
-    /// repairs hold ("every registered ID is apcore-legal", "every registered
-    /// module has a non-empty description") hold unconditionally whatever this
-    /// returns.
+    /// The caller's own per-operation hook. Handed to the scanner as it is, so
+    /// it runs **first** — before the toolkit's final ID normalisation, and
+    /// before this backend's legality skip and description repair, which both
+    /// operate on what `scan` returns. The two invariants those hold ("every
+    /// registered ID is apcore-legal", "every registered module has a non-empty
+    /// description") therefore hold whatever this returns, and a hook returning
+    /// `MyThing` registers as `my_thing`.
     ///
     /// Spelled with apcore-toolkit's own `TransformModuleHook` alias, so a hook
     /// written against the scanner drops in here unchanged.
@@ -444,17 +465,10 @@ pub async fn openapi_backend(
 ) -> Result<Arc<Registry>, APCoreA2AError> {
     require_prefix(&options)?;
 
-    // Collected through an `Arc<Mutex<_>>` because `TransformModuleHook` is
-    // `Send + Sync`: the hook cannot borrow a local `Vec`, and a hook returning
-    // `None` drops the module SILENTLY, so reporting is this function's job and
-    // cannot be delegated to the scanner.
-    let dropped: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let synthesized: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    let dropped_hook = Arc::clone(&dropped);
-    let synthesized_hook = Arc::clone(&synthesized);
-    let caller_hook = options.transform_module;
-
+    // The caller's own `transform_module` is handed to the scanner as it is, so
+    // it runs FIRST: everything below operates on what `scan` returns, after
+    // that hook, the toolkit's normalisation, its filters and its
+    // deduplication.
     let mut scan_options = ScanOptions::new();
     scan_options.include = options.include;
     scan_options.exclude = options.exclude;
@@ -462,64 +476,53 @@ pub async fn openapi_backend(
     scan_options.include_deprecated = options.include_deprecated;
     scan_options.transform_operation = options.transform_operation;
     scan_options.derive_module_id = options.derive_module_id;
-    scan_options.transform_module = Some(Box::new(move |module: ScannedModule| {
-        // 1. The caller's own hook FIRST, so the invariants below hold
-        //    unconditionally, whatever it returns.
-        let mut module = match &caller_hook {
-            Some(hook) => hook(module)?,
-            None => module,
-        };
+    scan_options.transform_module = options.transform_module;
 
-        // 2. FR-OAS-003: repair the description before the module can reach a
-        //    card filter that would silently drop it.
-        let was_synthesized = module.description.trim().is_empty();
-        if was_synthesized {
-            module.description = synthesize_description(&module);
-        }
-
-        // 3. FR-OAS-002 LAST, so "every registered module ID is apcore-legal"
-        //    holds unconditionally. It still runs BEFORE the scanner's own
-        //    `deduplicate_ids` — which happens after this callback — because
-        //    lowercasing can CREATE a collision the document did not have:
-        //    `listPets` and `listpets` are two operations to OpenAPI and one
-        //    module ID to apcore.
-        let Some(projected) = project_module_id(&module.module_id) else {
-            if let Ok(mut guard) = dropped_hook.lock() {
-                guard.push((
-                    module.module_id.clone(),
-                    offending_segment(&module.module_id),
-                ));
-            }
-            return None;
-        };
-        module.module_id = projected;
-
-        // Report the POST-projection id: it is the one that reaches the Agent
-        // Card, and a diagnostic naming the pre-projection id sends the operator
-        // looking for a skill that does not exist.
-        if was_synthesized {
-            if let Ok(mut guard) = synthesized_hook.lock() {
-                guard.push(module.module_id.clone());
-            }
-        }
-        Some(module)
-    }));
-
-    let modules = OpenAPIScanner::new()
+    let scanned = OpenAPIScanner::new()
         .scan(document, &scan_options)
         .await
         .map_err(|e| APCoreA2AError::Config(format!("apcore-a2a.openapi: {e}")))?;
+    let scanned_count = scanned.len();
+
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut synthesized: Vec<String> = Vec::new();
+    let mut modules: Vec<ScannedModule> = Vec::with_capacity(scanned_count);
+    for mut module in scanned {
+        // FR-OAS-002: apcore-toolkit >= 0.13 emits the Canonical ID alphabet, so
+        // the emitted ID is registered unchanged — never projected again. It
+        // leaves exactly one thing unrepaired (a segment beginning with a digit,
+        // or an empty ID from a hook), and that module is skipped HERE, before
+        // the writer: handed to the writer, apcore's registry would reject it as
+        // a write failure, and every diagnostic below would count it. Checked on
+        // the returned ID, never inside `transform_module`, where a hook's
+        // `MyThing` has not yet been normalised to `my_thing`.
+        if let Some(segment) = illegal_segment(&module.module_id) {
+            skipped.push((module.module_id.clone(), segment.to_string()));
+            continue;
+        }
+
+        // FR-OAS-003: repair the description before the module can reach a card
+        // filter that would silently drop it. Recorded under the EMITTED id —
+        // the one on the Agent Card, dedup suffix included.
+        if module.description.trim().is_empty() {
+            module.description = synthesize_description(&module);
+            synthesized.push(module.module_id.clone());
+        }
+        modules.push(module);
+    }
 
     // --- Diagnostics, in the order the feature spec's "Emits" list states -----
-    let dropped = take(&dropped);
-    for (derived_id, segment) in &dropped {
+    for (module_id, segment) in &skipped {
         tracing::warn!(
-            "apcore-a2a: skipping OpenAPI operation '{derived_id}' — the derived module ID has a \
+            "apcore-a2a: skipping OpenAPI operation '{module_id}' — the derived module ID has a \
              segment ('{segment}') apcore's registry cannot accept (it must match \
              ^[a-z][a-z0-9_]*$), and it cannot be repaired without inventing an ID. Supply a \
              derive_module_id or transform_module hook to name this operation yourself."
         );
     }
+    // Scanner warnings are re-emitted for the modules that will register. A
+    // skipped module's own legality warning from the toolkit says what the skip
+    // WARNING above already said, so it is not repeated.
     for module in &modules {
         for warning in &module.warnings {
             tracing::warn!("apcore-a2a: {}: {warning}", module.module_id);
@@ -531,7 +534,6 @@ pub async fn openapi_backend(
              have no skills."
         );
     }
-    let mut synthesized = take(&synthesized);
     if !synthesized.is_empty() {
         synthesized.sort();
         tracing::info!(
@@ -539,7 +541,7 @@ pub async fn openapi_backend(
              \"{{METHOD}} {{path}}\" description was synthesized so they appear on the Agent Card. \
              Affected: {}",
             synthesized.len(),
-            modules.len() + dropped.len(),
+            scanned_count,
             synthesized.join(", ")
         );
     }
@@ -609,13 +611,6 @@ pub async fn openapi_backend(
         options.governance_state.as_ref(),
     );
     Ok(registry)
-}
-
-/// Drain an `Arc<Mutex<Vec<_>>>` collected by the scan hook.
-fn take<T>(cell: &Arc<Mutex<Vec<T>>>) -> Vec<T> {
-    cell.lock()
-        .map(|mut g| std::mem::take(&mut *g))
-        .unwrap_or_default()
 }
 
 /// FR-OAS-006, checked before any fetch or scan.
@@ -872,7 +867,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // `project_module_id` is deprecated — apcore-toolkit >= 0.13 emits IDs in
+    // apcore's alphabet and the backend no longer calls it — but still public, so
+    // its behaviour stays pinned until the minor release that removes it.
     #[test]
+    #[allow(deprecated)]
     fn projects_camel_case_and_hyphens() {
         assert_eq!(project_module_id("listPets").as_deref(), Some("listpets"));
         assert_eq!(
@@ -890,13 +889,27 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn refuses_a_segment_that_cannot_be_repaired() {
         // An apcore segment may not begin with a digit, and prefixing one would
         // be inventing an ID rather than projecting the derived one.
         assert_eq!(project_module_id("v1.2fa.get"), None);
         assert_eq!(project_module_id("9lives"), None);
         assert_eq!(project_module_id(""), None);
-        assert_eq!(offending_segment("v1.2fa.get"), "2fa");
+    }
+
+    #[test]
+    fn illegal_segment_reads_the_emitted_id_as_it_is() {
+        // The skip policy's test: no projection first, so an ID the toolkit
+        // emitted legal is legal, and the offending segment is named verbatim.
+        assert_eq!(illegal_segment("v1.2fa.get"), Some("2fa"));
+        assert_eq!(illegal_segment("list_pets"), None);
+        assert_eq!(illegal_segment("pet_store.list_pets_2"), None);
+        assert_eq!(illegal_segment("Ab.9x"), Some("Ab"));
+        // An empty ID — only a hook can produce one — names the empty segment,
+        // as the toolkit's own legality warning does.
+        assert_eq!(illegal_segment(""), Some(""));
+        assert_eq!(illegal_segment("a..b"), Some(""));
     }
 
     #[test]

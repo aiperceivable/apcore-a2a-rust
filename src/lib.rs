@@ -57,5 +57,11 @@ pub use crate::client::{A2AClient, A2AClientError, AgentCardFetcher, ClientResul
 #[cfg(feature = "openapi")]
 pub use crate::openapi_backend::{
     build_openapi_backend_from_config, openapi_backend, openapi_backend_from_spec,
-    project_module_id, resolve_spec_location, synthesize_description, OpenAPIBackendOptions,
+    resolve_spec_location, synthesize_description, OpenAPIBackendOptions,
 };
+// Deprecated (apcore-toolkit >= 0.13 emits IDs in apcore's alphabet); still
+// re-exported so `apcore_a2a::project_module_id` keeps resolving until a later
+// minor release removes it.
+#[cfg(feature = "openapi")]
+#[allow(deprecated)]
+pub use crate::openapi_backend::project_module_id;

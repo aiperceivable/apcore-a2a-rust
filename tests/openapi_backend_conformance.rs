@@ -6,8 +6,10 @@
 //! module set, the repaired descriptions, the emitted diagnostics and the
 //! resulting Agent Card.
 //!
-//! The scanner's own derivation is pinned by apcore-toolkit's 24-case corpus,
-//! not here. What this driver checks is everything the binding adds on top.
+//! The scanner's own derivation — including the normalisation of every module
+//! ID into apcore's Canonical ID alphabet (apcore-toolkit >= 0.13.0) — is pinned
+//! by apcore-toolkit's 33-case corpus, not here. What this driver checks is
+//! everything the binding adds on top.
 //!
 //! Unlike apcore-mcp's Rust driver — which asserts no diagnostic at all,
 //! because it has no log capture — every warning and INFO line the fixture
@@ -30,12 +32,12 @@ use apcore::executor::Executor;
 use apcore::module::Module;
 use apcore::registry::registry::Registry;
 use apcore_a2a::adapters::agent_card::AgentCapabilities;
-use apcore_a2a::openapi_backend::{
-    openapi_backend, project_module_id, resolve_spec_location, OpenAPIBackendOptions,
-};
+use apcore_a2a::openapi_backend::{openapi_backend, resolve_spec_location, OpenAPIBackendOptions};
 use apcore_a2a::{
     build_app, build_app_with_auth, APCoreA2AConfig, AgentCardBuilder, BackendSource, SkillMapper,
 };
+use apcore_toolkit::openapi_scanner::TransformModuleHook;
+use apcore_toolkit::types::ScannedModule;
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::Request;
@@ -111,7 +113,7 @@ fn case_id(case: &Value) -> &str {
 /// stays on the thread the guard covers.
 ///
 /// The level prefix is what makes the diagnostic assertions real. The feature
-/// spec states a *level* for each report — the projection drop at WARNING, the
+/// spec states a *level* for each report — the illegal-ID skip at WARNING, the
 /// description repair at INFO, a write failure at ERROR — and a capture that
 /// records every level without saying which would pass for an implementation
 /// that demoted all of them to `debug!`, where no operator will ever see them.
@@ -193,7 +195,35 @@ fn options_for(case: &Value) -> OpenAPIBackendOptions {
             .get("additional_backend_source")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        transform_module: transform_module_hook_for(case),
         ..OpenAPIBackendOptions::new()
+    }
+}
+
+/// The `transform_module` hook a case names under `hooks`, implemented here.
+/// The fixture's notes define each one.
+///
+/// **Panics on a name this driver does not implement**, and on any other hook
+/// key: ignoring it would silently run the hook-free path and pass a case that
+/// asserts what a hook does.
+fn transform_module_hook_for(case: &Value) -> Option<TransformModuleHook> {
+    let hooks = case.get("hooks").and_then(Value::as_object)?;
+    let id = case_id(case);
+    for key in hooks.keys() {
+        assert!(
+            key == "transform_module",
+            "{id}: the fixture names a hook this driver does not implement: {key:?}"
+        );
+    }
+    let name = hooks.get("transform_module")?.as_str().unwrap_or_default();
+    match name {
+        "rename_to_mixed_case_id" => Some(Box::new(|mut module: ScannedModule| {
+            module.module_id = "MyThing".to_string();
+            Some(module)
+        })),
+        other => {
+            panic!("{id}: the fixture names a transform_module hook this driver lacks: {other:?}")
+        }
     }
 }
 
@@ -284,12 +314,12 @@ async fn conformance_openapi_modules() {
                 );
             }
 
-            // FR-OAS-003: the INFO line names the POST-projection id, because
-            // that is the one that reaches the Agent Card. Naming the derived id
-            // would send the operator looking for a skill that does not exist —
-            // so the assertion is scoped to the synthesis line itself. The whole
-            // log would not discriminate: apcore-toolkit's writer emits its own
-            // "Registered HTTP proxy: <projected id>" line for every module.
+            // FR-OAS-003: the INFO line names the EMITTED id — dedup suffix
+            // included — because that is the one that reaches the Agent Card.
+            // Naming any other id would send the operator looking for a skill
+            // that does not exist — so the assertion is scoped to the synthesis
+            // line itself. The whole log would not discriminate: apcore-toolkit's
+            // writer may log its own "Registered HTTP proxy: <id>" line.
             let synthesis_report = synthesis_line(&logs);
             match module
                 .get("description_was_synthesized")
@@ -312,8 +342,41 @@ async fn conformance_openapi_modules() {
             }
         }
 
-        // A dropped operation must be reported: the projection runs inside a
-        // transform_module hook, and a hook returning None drops it SILENTLY.
+        // FR-OAS-003 report contents, scoped to the synthesis line itself.
+        if let Some(report) = case.get("expected_synthesis_report") {
+            let line = synthesis_line(&logs)
+                .unwrap_or_else(|| panic!("{id}: no synthesis report in:\n{logs}"));
+            for needle in str_list(report.get("contains")) {
+                assert!(
+                    line.contains(&needle),
+                    "{id}: the synthesis report lacks {needle:?}: {line}"
+                );
+            }
+            for needle in str_list(report.get("excludes")) {
+                assert!(
+                    !line.contains(&needle),
+                    "{id}: the synthesis report names {needle:?}: {line}"
+                );
+            }
+        }
+
+        // Skipping an illegal ID before the writer, not leaving apcore's
+        // registry to reject it: the rejection also leaves it unregistered, but
+        // as a write-failure ERROR.
+        if case
+            .get("expected_no_error_logs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let errors = at_level(&logs, "ERROR");
+            assert!(
+                errors.is_empty(),
+                "{id}: expected no ERROR lines, got {errors:?}"
+            );
+        }
+
+        // A skipped operation must be reported, naming the emitted ID and the
+        // offending segment: an implementation that silently drops it fails here.
         for drop in case
             .get("expected_dropped")
             .and_then(Value::as_array)
@@ -322,7 +385,7 @@ async fn conformance_openapi_modules() {
         {
             let derived = drop["derived_id"].as_str().unwrap();
             let segment = drop["offending_segment"].as_str().unwrap();
-            // At WARNING, and naming BOTH the derived ID and the offending
+            // At WARNING, and naming BOTH the emitted ID and the offending
             // segment — an implementation that merely drops the module passes
             // every other assertion in this group and fails this one.
             let line = at_level(&logs, "WARN")
@@ -749,7 +812,7 @@ async fn base_url_option_supplies_what_the_document_lacks() {
     )
     .await
     .expect("base_url must be honoured");
-    assert_eq!(registry_ids(&registry), vec!["listpets".to_string()]);
+    assert_eq!(registry_ids(&registry), vec!["list_pets".to_string()]);
 }
 
 /// A minimal, valid OpenAPI 3.0 document, as an HTTP/1.1 response body.
@@ -828,7 +891,7 @@ async fn headers_are_sent_with_the_spec_fetch() {
     )
     .await
     .expect("fetch and scan");
-    assert_eq!(registry_ids(&registry), vec!["listpets".to_string()]);
+    assert_eq!(registry_ids(&registry), vec!["list_pets".to_string()]);
 
     let request = server.await.unwrap().to_lowercase();
     assert!(
@@ -838,10 +901,14 @@ async fn headers_are_sent_with_the_spec_fetch() {
 }
 
 // ---------------------------------------------------------------------------
-// Projection unit coverage (FR-OAS-002)
+// FR-OAS-002 unit coverage — registry-legal IDs, and the deprecated projection
 // ---------------------------------------------------------------------------
 
+/// Deprecated — apcore-toolkit >= 0.13 emits IDs in apcore's alphabet and the
+/// backend no longer calls it — but still public, including through the crate
+/// root, so its behaviour stays pinned until the minor release that removes it.
 #[test]
+#[allow(deprecated)]
 fn projection_alphabet() {
     for (raw, expected) in [
         ("listPets", Some("listpets")),
@@ -852,9 +919,153 @@ fn projection_alphabet() {
         ("9lives", None),
     ] {
         assert_eq!(
-            project_module_id(raw).as_deref(),
+            apcore_a2a::project_module_id(raw).as_deref(),
             expected,
             "project_module_id({raw:?})"
         );
     }
+}
+
+/// Nothing internal may call the deprecated projection any more. It is the
+/// identity on every ID apcore-toolkit >= 0.13 emits, so a call would be dead
+/// work; where it was NOT a no-op — inside `transform_module`, before the
+/// toolkit's final normalisation — it produced a different ID than the toolkit
+/// (`MyThing` -> `mything`, not `my_thing`). Read from the source, outside its
+/// own `#[cfg(test)]` module, since a free function cannot be intercepted.
+#[test]
+fn the_backend_never_calls_project_module_id() {
+    let source = include_str!("../src/openapi_backend.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap();
+    let calls = production.matches("project_module_id(").count();
+    let definitions = production.matches("fn project_module_id(").count();
+    assert_eq!(
+        definitions, 1,
+        "precondition: the definition is in the scanned text"
+    );
+    assert_eq!(
+        calls - definitions,
+        0,
+        "project_module_id is called from production code"
+    );
+}
+
+fn one_operation_document() -> Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": { "title": "Pets", "version": "1.0.0" },
+        "servers": [{ "url": "https://api.example.com" }],
+        "paths": { "/pets": { "get": {
+            "operationId": "listPets", "summary": "List pets",
+            "responses": { "200": { "description": "ok" } }
+        } } }
+    })
+}
+
+#[tokio::test]
+async fn an_illegal_hook_returned_id_is_skipped_naming_its_segment() {
+    // The skip applies to whatever the scanner emitted, hook output included. An
+    // empty ID (only a hook can produce one) names the empty segment, as the
+    // toolkit's own legality warning does.
+    for (hook_id, segment) in [("", ""), ("v1.2fa", "2fa"), ("Ab.9x", "9x")] {
+        let owned = hook_id.to_string();
+        let options = OpenAPIBackendOptions {
+            derive_module_id: Some(Box::new(move |_, _, _| Some(owned.clone()))),
+            ..OpenAPIBackendOptions::new()
+        };
+        let (result, logs) = captured_logs(openapi_backend(
+            &one_operation_document(),
+            Arc::new(Registry::new()),
+            options,
+        ))
+        .await;
+        let registry = result.expect("a skipped module is not an error");
+        assert!(
+            registry_ids(&registry).is_empty(),
+            "{hook_id:?}: registered"
+        );
+        let skips: Vec<&str> = at_level(&logs, "WARN")
+            .into_iter()
+            .filter(|l| l.contains("skipping OpenAPI operation"))
+            .collect();
+        assert_eq!(skips.len(), 1, "{hook_id:?}: {logs}");
+        assert!(
+            skips[0].contains(&format!("('{segment}')")),
+            "{hook_id:?}: the skip must name segment {segment:?}: {}",
+            skips[0]
+        );
+        assert!(at_level(&logs, "ERROR").is_empty(), "{hook_id:?}: {logs}");
+    }
+}
+
+#[tokio::test]
+async fn a_skipped_module_reaches_no_later_diagnostic() {
+    // An undocumented `POST /v1/2fa` is the worst case: handed to the writer
+    // instead, the synthesis report would count it, FR-OAS-005 would warn about a
+    // write operation that is not on the card, and the zero-modules warning —
+    // the only true statement — would not fire.
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": { "title": "t", "version": "1" },
+        "servers": [{ "url": "https://api.example.com" }],
+        "paths": { "/v1/2fa": { "post": { "responses": { "200": { "description": "ok" } } } } }
+    });
+    let (result, logs) = captured_logs(openapi_backend(
+        &document,
+        Arc::new(Registry::new()),
+        OpenAPIBackendOptions::new(),
+    ))
+    .await;
+    let registry = result.expect("a skipped module is not an error");
+    assert!(registry_ids(&registry).is_empty());
+    let warnings = at_level(&logs, "WARN").join("\n");
+    assert!(
+        warnings.contains("skipping OpenAPI operation 'v1.2fa.post'"),
+        "{logs}"
+    );
+    assert!(warnings.contains("no registrable modules"), "{logs}");
+    assert!(!warnings.contains("PUBLIC Agent Card"), "{logs}");
+    assert!(synthesis_line(&logs).is_none(), "{logs}");
+    assert!(at_level(&logs, "ERROR").is_empty(), "{logs}");
+    // The toolkit's own legality warning is not re-emitted beside the skip line.
+    assert!(
+        !warnings.contains("is not a legal apcore module ID"),
+        "{logs}"
+    );
+}
+
+#[tokio::test]
+async fn the_caller_hook_runs_before_normalisation_and_the_repair() {
+    // The hook renames to a camelCase, hyphenated ID and clears the description.
+    // apcore-toolkit >= 0.13 normalises the final ID after the hook
+    // (`pet_store.list_pets`, words split), and the repair runs on what `scan`
+    // returns — so the module registers, legal and described. A legality check
+    // inside the hook would have skipped it; the retired in-hook projection would
+    // have registered `pet_store.listpets`.
+    let options = OpenAPIBackendOptions {
+        transform_module: Some(Box::new(|mut module: ScannedModule| {
+            module.module_id = "Pet-Store.ListPets".to_string();
+            module.description = "   ".to_string();
+            Some(module)
+        })),
+        ..OpenAPIBackendOptions::new()
+    };
+    let (result, logs) = captured_logs(openapi_backend(
+        &one_operation_document(),
+        Arc::new(Registry::new()),
+        options,
+    ))
+    .await;
+    let registry = result.expect("backend");
+    assert_eq!(
+        registry_ids(&registry),
+        vec!["pet_store.list_pets".to_string()]
+    );
+    let definition = registry
+        .get_definition("pet_store.list_pets")
+        .expect("registry read")
+        .expect("registered");
+    assert_eq!(definition.description, "GET /pets");
+    let line = synthesis_line(&logs).expect("a synthesis report");
+    assert!(line.contains("pet_store.list_pets"), "{line}");
+    assert!(!line.contains("Pet-Store.ListPets"), "{line}");
 }

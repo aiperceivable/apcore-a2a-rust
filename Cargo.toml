@@ -31,7 +31,7 @@ apcore = ">=0.31"
 # toolkit — is reached through this crate's `openapi` feature instead of being
 # enabled unconditionally. The unconditional import (`deep_resolve_refs`) is
 # outside that feature.
-apcore-toolkit = { version = ">=0.12.0", default-features = false }
+apcore-toolkit = { version = ">=0.13.0", default-features = false }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

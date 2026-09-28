@@ -42,7 +42,7 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 
 - Rust edition 2021
 - `apcore` >= 0.31
-- `apcore-toolkit` >= 0.12.0
+- `apcore-toolkit` >= 0.13.0
 
 ---
 
@@ -102,6 +102,12 @@ Precedence is per key, and an explicit flag wins: `--openapi-prefix zoo` above o
 `prefix` and leaves `spec`, `include_deprecated`, `timeout` and `headers` exactly as
 configured. `timeout`, `include`, `exclude` and `acknowledge_unapproved_writes` have no flag
 in any of the three SDKs and are set through the Config Bus only.
+
+Each skill's ID is the module ID apcore-toolkit (>= 0.13) derives, already in apcore's ID
+alphabet: `operationId: listPets` under prefix `petstore` becomes `petstore.list_pets`, and
+`GET /pets/{petId}` without an `operationId` becomes `petstore.pets.pet_id.get`. An operation
+whose ID still has a segment beginning with a digit (`/v1/2fa`) is skipped with a warning —
+name it with a `derive_module_id` or `transform_module` hook.
 
 > **Warning:** an OpenAPI document describes an API's *shape*, not the *consequences* of
 > calling it, so `requires_approval` is never inferred — a `POST /charges` that moves money is
