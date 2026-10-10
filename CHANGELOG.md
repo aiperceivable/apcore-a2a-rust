@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-10-10
+
+### Changed
+
+- Raise the dependency floors to apcore 0.32.0 and apcore-toolkit 0.14.0.
+  Python's `openapi` extra uses the same toolkit floor.
+- Align runtime declarations with upstream requirements: Node.js 20+ and
+  Rust 1.86+. Update the TypeScript CI Node version accordingly.
+
+### Fixed
+
+- Render input validation diagnostics from apcore's canonical
+  `details.errors` entries (`path`, `keyword`, `message`). Preserve RFC 6901
+  JSON Pointers, including nested indices and escaped property names, and
+  display the empty root pointer as `<root>`. Free-form diagnostic messages
+  still pass through path/traceback sanitization and the combined message is
+  limited to 500 characters. Output/config failures remain internal errors;
+  errors without canonical diagnostics retain the sanitized original message.
+- Extend the shared error-mapping conformance driver to exercise structured
+  diagnostics instead of synthesizing field names into the error message.
+
+### Compatibility
+
+- Toolkit 0.14.0 tightens binding-file validation (unknown keys, incomplete
+  schema pairs and strict-mode tags). The A2A backend does not use that loader;
+  its OpenAPI scanner, registry writer and reference resolver need no API change.
+  Deployments that load bindings separately must move custom entry keys into
+  `metadata`, supply both inline schemas, and use list-valued `tags`.
+- Core 0.32.0's governance, cancellation, redaction and registration fixes are
+  inherited through the existing executor/registry APIs. No A2A wire-code or
+  OpenAPI skill-ID migration is required for this update.
+
 ## [0.8.1] - 2026-09-29
 
 Adopts apcore-toolkit 0.13.0, whose `OpenAPIScanner` now emits every `module_id` in apcore's

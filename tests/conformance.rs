@@ -343,6 +343,13 @@ fn conformance_error_mapping() {
         let name = spec["exception"].as_str().unwrap();
         let (code, message) = match name {
             "ModuleNotFoundError" => (ErrorCode::ModuleNotFound, "module not found".to_string()),
+            "SchemaValidationError" if spec.get("details").is_some() => (
+                ErrorCode::SchemaValidationError,
+                spec["message"]
+                    .as_str()
+                    .unwrap_or("Input validation failed")
+                    .to_string(),
+            ),
             "SchemaValidationError" => {
                 let fields: Vec<String> = spec["errors"]
                     .as_object()
@@ -372,7 +379,16 @@ fn conformance_error_mapping() {
                 spec["message"].as_str().unwrap_or("boom").to_string(),
             ),
         };
-        let rpc = ErrorMapper::to_jsonrpc_error(&ModuleError::new(code, &message));
+        let mut err = ModuleError::new(code, &message);
+        if let Some(details) = spec.get("details").and_then(Value::as_object) {
+            err = err.with_details(
+                details
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            );
+        }
+        let rpc = ErrorMapper::to_jsonrpc_error(&err);
         assert_eq!(
             rpc.code,
             case["expected_error_code"].as_i64().unwrap() as i32,

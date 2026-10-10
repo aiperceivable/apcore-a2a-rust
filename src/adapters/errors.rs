@@ -82,7 +82,7 @@ impl ErrorMapper {
             }
             ApcoreErrorCode::SchemaValidationError => JsonRpcError {
                 code: CODE_INVALID_PARAMS,
-                message: sanitize_message(&error.message),
+                message: schema_error_message(error),
             },
             // The A2A spec §13.2 MUST NOT forbids revealing *the existence of
             // a resource*, not the *class* of failure. A fixed "Access denied"
@@ -227,6 +227,33 @@ fn is_server_side_schema_error(message: &str) -> bool {
         message == format!("{direction} validation failed")
             || message.starts_with(&format!("{direction} schema is invalid: "))
     })
+}
+
+/// Preserve canonical JSON Pointers without treating them as file paths.
+fn schema_error_message(error: &ModuleError) -> String {
+    let diagnostics: Vec<String> = error
+        .details
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.get("path")?.as_str()?;
+            let keyword = entry.get("keyword")?.as_str()?;
+            let message = entry.get("message")?.as_str()?;
+            // Only the structured pointer bypasses filesystem-path redaction.
+            let path = if path.is_empty() { "<root>" } else { path };
+            Some(format!(
+                "{path} [{}]: {}",
+                sanitize_message(keyword),
+                sanitize_message(message)
+            ))
+        })
+        .collect();
+    if diagnostics.is_empty() {
+        return sanitize_message(&error.message);
+    }
+    diagnostics.join("; ").chars().take(500).collect()
 }
 
 /// Strip paths, tracebacks and excess whitespace from text bound for a caller.
@@ -555,5 +582,50 @@ mod tests {
             assert_eq!(resp.code, CODE_INVALID_PARAMS, "{message}");
             assert_eq!(resp.message, message, "{message}");
         }
+    }
+
+    #[test]
+    fn native_validation_preserves_json_pointer() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": {
+                "type": "object", "properties": {"width": {"type": "integer"}}
+            }}}
+        });
+        let error = apcore::executor::validate_against_schema(
+            &serde_json::json!({"items": [{"width": "bad"}]}),
+            &schema,
+            "Input",
+        )
+        .unwrap_err();
+        assert_eq!(error.details["errors"][0]["path"], "/items/0/width");
+        let rpc = ErrorMapper::to_jsonrpc_error(&error);
+        assert_eq!(rpc.code, CODE_INVALID_PARAMS);
+        assert!(rpc.message.contains("/items/0/width [type]:"));
+        assert_eq!(
+            serde_json::to_value(rpc)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn canonical_validation_message_is_bounded() {
+        let mut error = make_error(
+            ApcoreErrorCode::SchemaValidationError,
+            "Input validation failed",
+        );
+        error.details.insert(
+            "errors".into(),
+            serde_json::json!([
+                {"path": "/width", "keyword": "type", "message": "\u{754c}".repeat(600)}
+            ]),
+        );
+        let message = ErrorMapper::to_jsonrpc_error(&error).message;
+        assert!(message.starts_with("/width [type]: "));
+        assert_eq!(message.chars().count(), 500);
     }
 }

@@ -464,7 +464,7 @@ fn error_to_status(err: &ModuleError, disclose_refusal_reason: bool) -> TaskStat
 /// - internal / unrecognized errors keep the fixed `"Internal server error"`
 ///   (srs FR-ERR-004 / FR-ERR-008, locked by `error_mapping.json` and by
 ///   `streaming_events.json`'s `error_midstream_skips_marker`);
-/// - `ACL_DENIED` stays masked as `"Task not found"` (srs FR-ERR-003);
+/// - `ACL_DENIED` carries the fixed `"Access denied"` message (srs FR-ERR-003);
 /// - caller-fixable classes (schema validation, invalid input, unknown module)
 ///   carry their sanitized detail, which srs FR-ERR-002 requires precisely so a
 ///   caller "can correct their input without guessing".
@@ -1455,6 +1455,22 @@ mod tests {
         let text = status_text(&status).unwrap();
         assert!(text.contains("alice"));
         assert!(text.contains("admin.wipe"));
+    }
+
+    #[test]
+    fn canonical_schema_diagnostics_preserve_pointer_in_failed_status() {
+        let err = ModuleError::new(ErrorCode::SchemaValidationError, "Input validation failed")
+            .with_details(std::collections::HashMap::from([(
+                "errors".to_string(),
+                serde_json::json!([
+                    {"path": "/items/0/width", "keyword": "type", "message": "must be integer"}
+                ]),
+            )]));
+        let status = error_to_status(&err, false);
+        assert_eq!(status.state, TaskState::Failed);
+        assert!(status_text(&status)
+            .unwrap()
+            .contains("/items/0/width [type]: must be integer"));
     }
 
     #[test]

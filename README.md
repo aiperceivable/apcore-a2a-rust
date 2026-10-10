@@ -40,9 +40,9 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 
 ## Requirements
 
-- Rust edition 2021
-- `apcore` >= 0.31
-- `apcore-toolkit` >= 0.13.0
+- Rust >= 1.86 (edition 2021)
+- `apcore` >= 0.32.0
+- `apcore-toolkit` >= 0.14.0
 
 ---
 
