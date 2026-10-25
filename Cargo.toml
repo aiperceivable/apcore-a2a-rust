@@ -1,6 +1,6 @@
 [package]
 name = "apcore-a2a"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 rust-version = "1.86"
 description = "A2A protocol adapter for apcore — expose apcore modules as A2A agents"
@@ -27,7 +27,7 @@ default = []
 openapi = ["apcore-toolkit/http-proxy"]
 
 [dependencies]
-apcore = ">=0.32.1"
+apcore = ">=0.32.3"
 # `default-features = false` so `http-proxy` — a *default* feature of the
 # toolkit — is reached through this crate's `openapi` feature instead of being
 # enabled unconditionally. The unconditional import (`deep_resolve_refs`) is
