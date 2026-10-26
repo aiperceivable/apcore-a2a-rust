@@ -40,9 +40,12 @@ Built on [axum](https://github.com/tokio-rs/axum) and [tokio](https://tokio.rs/)
 
 ## Requirements
 
+Toolkit 0.14.1 is published, but the crates.io index did not return that version during local verification. Source builds currently use the sibling checkout `../apcore-toolkit-rust` with the `>=0.14.1` version requirement; clone that repository alongside this SDK. The local release commit matches the published 0.14.1 crate. Remove the temporary `path` dependency once Cargo can resolve the indexed release.
+
+
 - Rust >= 1.86 (edition 2021)
-- `apcore` >= 0.32.0
-- `apcore-toolkit` >= 0.14.0
+- `apcore` >= 0.32.3
+- `apcore-toolkit` >= 0.14.1
 
 ---
 
