@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-11-19
+
+### Changed
+
+- Upgrade `jsonwebtoken` to 10 with the `rust_crypto` backend (was 9/ring).
+  JWT validation behaviour and the supported algorithms are unchanged; the
+  authentication and A2A integration suites pass on the new backend.
+
 ## [0.8.2] - 2026-10-10
 
 ### Changed
