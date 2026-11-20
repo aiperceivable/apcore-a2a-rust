@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.6] - 2026-11-20
+
+### Fixed
+
+- The standalone OpenAPI backend resolves inherited and referenced parameters.
+  It checks the final filtered selection before writing any proxies and reports
+  operations that the toolkit cannot forward.
+
 ## [0.8.5] - 2026-11-19
 
 ### Changed

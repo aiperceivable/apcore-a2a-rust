@@ -3,7 +3,7 @@
 //! Pipeline:
 //!
 //! ```text
-//! load_spec -> OpenAPIScanner::scan -> [skip illegal IDs, repair descriptions]
+//! load_spec -> OpenAPIScanner::scan_with_effective_parameters -> [skip illegal IDs, repair descriptions]
 //!           -> HTTPProxyRegistryWriter::write -> Registry
 //! ```
 //!
@@ -45,6 +45,7 @@ use apcore_toolkit::openapi_scanner::{
 };
 use apcore_toolkit::output::http_proxy_writer::HTTPProxyRegistryWriter;
 use apcore_toolkit::types::ScannedModule;
+use apcore_toolkit::validate_effective_proxy_modules;
 use serde_json::Value;
 
 use crate::APCoreA2AError;
@@ -303,7 +304,7 @@ pub struct OpenAPIBackendOptions {
     /// The caller's own per-operation hook. Handed to the scanner as it is, so
     /// it runs **first** — before the toolkit's final ID normalisation, and
     /// before this backend's legality skip and description repair, which both
-    /// operate on what `scan` returns. The two invariants those hold ("every
+    /// operate on what the scanner returns. The two invariants those hold ("every
     /// registered ID is apcore-legal", "every registered module has a non-empty
     /// description") therefore hold whatever this returns, and a hook returning
     /// `MyThing` registers as `my_thing`.
@@ -457,7 +458,8 @@ pub async fn openapi_backend_from_spec(
 ///
 /// Returns [`APCoreA2AError::Config`] when `prefix` is required and absent, when
 /// the document is not OpenAPI 3.0.x/3.1.x, when no base URL can be determined,
-/// or when a derived module ID collides with one already in `registry`.
+/// when a derived module ID collides with one already in `registry`, or when a
+/// selected operation cannot be forwarded.
 pub async fn openapi_backend(
     document: &Value,
     registry: Arc<Registry>,
@@ -466,7 +468,7 @@ pub async fn openapi_backend(
     require_prefix(&options)?;
 
     // The caller's own `transform_module` is handed to the scanner as it is, so
-    // it runs FIRST: everything below operates on what `scan` returns, after
+    // it runs FIRST: everything below operates on what the scanner returns, after
     // that hook, the toolkit's normalisation, its filters and its
     // deduplication.
     let mut scan_options = ScanOptions::new();
@@ -479,7 +481,7 @@ pub async fn openapi_backend(
     scan_options.transform_module = options.transform_module;
 
     let scanned = OpenAPIScanner::new()
-        .scan(document, &scan_options)
+        .scan_with_effective_parameters(document, &scan_options)
         .await
         .map_err(|e| APCoreA2AError::Config(format!("apcore-a2a.openapi: {e}")))?;
     let scanned_count = scanned.len();
@@ -586,6 +588,9 @@ pub async fn openapi_backend(
                     .to_string(),
             )
         })?;
+
+    validate_effective_proxy_modules(&modules)
+        .map_err(|error| APCoreA2AError::Config(error.to_string()))?;
 
     // --- Write --------------------------------------------------------------
     let writer = HTTPProxyRegistryWriter::new(
